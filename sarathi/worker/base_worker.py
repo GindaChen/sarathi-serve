@@ -133,6 +133,10 @@ class BaseWorker:
             self.config,
         )
 
+        # TODO: Initialize the CUDA graph here (if needed)
+        if not self.config.model_config.enforce_eager:
+            self.model_runner.capture_model(self.gpu_cache)
+
     @synchronized
     def add_seq(self, seq: Sequence) -> None:
         self.seq_manager.add_seq(seq)

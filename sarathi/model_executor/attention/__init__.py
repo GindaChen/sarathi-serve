@@ -1,6 +1,7 @@
 from enum import Enum
 from typing import Union
 
+from sarathi.model_executor.attention.cuda_attention_wrapper import FlashinferCUDAAttentionWrapper
 from sarathi.model_executor.attention.flashinfer_attention_wrapper import (
     FlashinferAttentionWrapper,
 )
@@ -28,6 +29,8 @@ def set_attention_backend(backend: Union[str, AttentionBackend]):
 def get_attention_wrapper():
     if ATTENTION_BACKEND == AttentionBackend.FLASHINFER:
         return FlashinferAttentionWrapper.get_instance()
+    elif ATTENTION_BACKEND == AttentionBackend.FLASHINFER_CUDA:
+        return FlashinferCUDAAttentionWrapper.get_instance()
     elif ATTENTION_BACKEND == AttentionBackend.NO_OP:
         return NoOpAttentionWrapper.get_instance()
 

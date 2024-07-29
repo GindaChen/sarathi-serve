@@ -36,4 +36,5 @@ class RequestLengthGeneratorType(Enum):
 
 class AttentionBackend(Enum):
     FLASHINFER = "FLASHINFER"
+    FLASHINFER_CUDA = "FLASHINFER_CUDA"
     NO_OP = "NO_OP"

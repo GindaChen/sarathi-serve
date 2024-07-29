@@ -57,6 +57,14 @@ class ModelConfig:
         },
     )
 
+    # TODO: Check if enforce_eager has proper command line control
+    enforce_eager: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to enforce eager execution. If True, we will disable CUDA graph and always execute the model in eager mode. If False, we will use CUDA graph and eager execution in hybrid."
+        }
+    )
+
     def __post_init__(self):
         self.hf_config = get_config(self.model, self.trust_remote_code, self.revision)
         self.dtype = get_and_verify_dtype(self.hf_config, self.dtype)
