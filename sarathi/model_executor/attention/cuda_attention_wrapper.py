@@ -1,4 +1,4 @@
-from typing import List, Optional, Iterable, Union, Tuple
+from typing import List, Optional, Iterable, Union, Tuple, Dict
 
 import torch
 from flashinfer import (
@@ -160,29 +160,7 @@ class DecodeSharedBuffer:
     pass
 
 
-class PrefillStageCUDAWrapper(BaseAttentionWrapper):
-
-    def __init__(
-        self, model_config: ModelConfig, parallel_config: ParallelConfig,
-    ):
-        super().__init__(model_config, parallel_config)
-
-        self.max_batch_size = None
-        self.shared_buffer = None
-        self.wrappers = None
-        self.graphs = None
-
-        self.active_wrapper = None
-        self.active_graph = None
-        self.is_metadata_initialized = False
-        self.is_profiling_iteration = False
-        self.contains_prefill = False
-        self.num_prefill_tokens = 0
-
-        self.append_qo_indptr_tensor = None
-        self.append_kv_page_indices_tensor = None
-        self.append_kv_page_indptr_tensor = None
-        self.append_kv_last_page_len_tensor = None
+class BaseCUDAAttentionWrapper(BaseAttentionWrapper):
 
     def to_int_tensor(self, data: List[int]) -> torch.Tensor:
         return torch.tensor(data, dtype=torch.int32, device="cuda")
@@ -196,6 +174,36 @@ class PrefillStageCUDAWrapper(BaseAttentionWrapper):
             self.head_dim,
             **kwargs,
         )
+
+    def get_wrapper(self, batch_size):
+        return self.wrappers[batch_size]
+
+    pass
+
+
+class PrefillStageCUDAWrapper(BaseCUDAAttentionWrapper):
+
+    def __init__(
+        self, model_config: ModelConfig, parallel_config: ParallelConfig,
+    ):
+        super().__init__(model_config, parallel_config)
+
+        self.max_batch_size = None
+        self.shared_buffer = None
+        self.wrappers: Dict[int, BatchPrefillWithPagedKVCacheWrapper] = None
+        self.graphs = None
+
+        self.active_wrapper = None
+        self.active_graph = None
+        self.is_metadata_initialized = False
+        self.is_profiling_iteration = False
+        self.contains_prefill = False
+        self.num_prefill_tokens = 0
+
+        self.append_qo_indptr_tensor = None
+        self.append_kv_page_indices_tensor = None
+        self.append_kv_page_indptr_tensor = None
+        self.append_kv_last_page_len_tensor = None
 
     def init_wrappers(self, max_batch_size, kv_data, total_num_pages, block_size):
         self.max_batch_size = max_batch_size
@@ -223,11 +231,9 @@ class PrefillStageCUDAWrapper(BaseAttentionWrapper):
 
         return
 
-    def get_wrapper(self, batch_size):
-        return self.wrappers[batch_size]
-
     def _begin_forward__init_cuda_graph(self, wrapper: BatchPrefillWithPagedKVCacheWrapper, batch_size: int, ):
         """Helper method for init_cuda_graph"""
+        self.active_wrapper = wrapper
         total_num_pages = batch_size
         block_size = self.block_size
 
@@ -254,7 +260,7 @@ class PrefillStageCUDAWrapper(BaseAttentionWrapper):
             wrapper = self.wrappers[batch_size]
             self._begin_forward__init_cuda_graph(wrapper, batch_size)
             g = torch.cuda.CUDAGraph()
-            o = self.shared_buffer.get_out(batch_size),
+            o = self.shared_buffer.get_out(batch_size)
             with g.capture_state():
                 o[:] = wrapper.forward(
                     self.shared_buffer.get_q(batch_size),
@@ -475,3 +481,79 @@ class PrefillStageCUDAWrapper(BaseAttentionWrapper):
         return output
 
 
+class MixedStageCUDAWrapper(BaseCUDAAttentionWrapper):
+    def __init__(
+        self, model_config: ModelConfig, parallel_config: ParallelConfig,
+    ):
+        super().__init__(model_config, parallel_config)
+        self.prefill_stage = PrefillStageCUDAWrapper(model_config, parallel_config)
+        self.decode_stage = PrefillStageCUDAWrapper(model_config, parallel_config)
+
+    def init_wrappers(self, max_batch_size, kv_data, total_num_pages, block_size):
+        self.max_batch_size = max_batch_size
+        self.prefill_stage.init_wrappers(max_batch_size, kv_data, total_num_pages, block_size)
+        self.decode_stage.init_wrappers(max_batch_size, kv_data, total_num_pages, block_size)
+        pass
+
+    def _init_cuda_graph(self, prefill_batch_size, decode_batch_size, pos_encoding_mode="NONE", softmax_scale=1.0):
+        g = torch.cuda.CUDAGraph()
+
+        # Get the active wrappers
+        prefill_wrapper = self.prefill_stage.wrappers[prefill_batch_size]
+        decode_wrapper = self.decode_stage.wrappers[decode_batch_size]
+
+        # Call begin_forward for both stages. This sets the active wrapper and all the metadata.
+        self.prefill_stage._begin_forward__init_cuda_graph(prefill_wrapper, prefill_batch_size)
+        self.decode_stage._begin_forward__init_cuda_graph(decode_wrapper, decode_batch_size)
+
+        # Get captured tensors
+        prefill_q = prefill_wrapper.shared_buffer.get_q(prefill_batch_size)
+        prefill_out = self.prefill_stage.shared_buffer.get_out(prefill_batch_size)
+        decode_q = decode_wrapper.shared_buffer.get_q(decode_batch_size)
+        decode_out = self.decode_stage.shared_buffer.get_out(decode_batch_size)
+        assert prefill_wrapper.shared_buffer.kv_data is decode_wrapper.shared_buffer.kv_data
+        kv_data = prefill_wrapper.shared_buffer.kv_data
+
+        with g.capture_state():
+            prefill_out[:] = prefill_wrapper.forward(
+                prefill_q,
+                kv_data,
+                pos_encoding_mode=pos_encoding_mode,
+                sm_scale=softmax_scale,
+            )
+            decode_out[:] = decode_wrapper.forward(
+                decode_q,
+                kv_data,
+                pos_encoding_mode=pos_encoding_mode,
+                sm_scale=softmax_scale,
+            )
+            pass
+        self.graphs[(prefill_batch_size, decode_batch_size)] = g
+        prefill_wrapper.end_forward()
+        decode_wrapper.end_forward()
+        pass
+
+    def init_cuda_graphs(self, pos_encoding_mode="NONE", softmax_scale=1.0):
+        # Init CUDA graphs for both (individual) stages
+        self.prefill_stage.init_cuda_graphs(pos_encoding_mode, softmax_scale)
+        self.decode_stage.init_cuda_graphs(pos_encoding_mode, softmax_scale)
+
+        # Init CUDA graph for mixed stages.
+        self.graphs = {(0, 0): None}
+        # spaces = list(range(1, self.max_batch_size + 1))
+        spaces = [1, 2, 4, 8, 16]
+        for prefill_batch_size in spaces:
+            for decode_batch_size in spaces:
+                # TODO: Filter some batch sizes
+                if prefill_batch_size + decode_batch_size > self.max_batch_size:
+                    continue
+                self._init_cuda_graph(
+                    prefill_batch_size, decode_batch_size,
+                    pos_encoding_mode=pos_encoding_mode,
+                    softmax_scale=softmax_scale
+                )
+                pass
+            pass
+        pass
+
+    pass
