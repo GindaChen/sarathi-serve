@@ -213,6 +213,23 @@ class ModelRunner:
         set_random_seed(self.config.model_config.seed)
         return num_gpu_blocks
 
+    @torch.inference_mode()
+    def capture_model(self, kv_cache):
+        _BATCH_SIZE_ALIGNMENT = 8
+        _BATCH_SIZES_TO_CAPTURE = [1, 2, 4] + [
+            _BATCH_SIZE_ALIGNMENT * i for i in range(1, 33)
+        ]
+        max_batch_size = max(_BATCH_SIZES_TO_CAPTURE)
+        input_tokens = torch.zeros(max_batch_size, dtype=torch.long).cuda()
+        input_positions = torch.zeros(max_batch_size, dtype=torch.long).cuda()
+        batch_size_capture_list = [
+            bs for bs in _BATCH_SIZES_TO_CAPTURE
+        ]
+        # TODO: Implement the logic to capture
+        #  the whole model via CUDA Graph.
+
+        pass
+
     def run(
         self,
         seq_metadata_list: List[SequenceMetadata],
