@@ -1,55 +1,30 @@
-from typing import List, Optional, Iterable
+from typing import List, Optional, Iterable, Union, Tuple
 
 import torch
-from flashinfer import BatchPrefillWithPagedKVCacheWrapper
+from flashinfer import (
+    BatchPrefillWithPagedKVCacheWrapper,
+    append_paged_kv_cache,
+)
 
 from sarathi.config import ModelConfig, ParallelConfig
 from sarathi.core.datatypes.sequence import SequenceMetadata
+from sarathi.metrics.constants import OperationMetrics
 from sarathi.model_executor.attention.base_attention_wrapper import BaseAttentionWrapper
 
 MB = 1024 * 1024
 
 
-class SharedBuffer:
-    """
-    Allocate shared buffer among different wrappers.
-    ---------
-    [shared]
-    kv_data
-
-    [prefill]
-    workspace_buffer
-    qo_indptr_buf
-    paged_kv_indptr_buf
-    paged_kv_indices_buf
-    paged_kv_last_page_len_buf
-    custom_mask_buf
-    qk_indptr_buf
-
-    q
-    paged_kv_data
-    output
-
-    [decode]
-    workspace_buffer
-    paged_kv_indptr_buffer
-    paged_kv_indices_buffer
-    paged_kv_last_page_len_buffer
-
-    q
-    paged_kv_data (global)
-    output
-    """
-
+class PrefillSharedBuffer:
     def __init__(
         self,
         max_batch_size: int,
         total_num_pages: int,
-        page_size: int,
+        block_size: int,
         num_kv_heads: int,
         num_qo_heads: int,
         head_dim: int,  # [64, 128, 256] according to flashinfer
         device,
+        kv_data: torch.Tensor,
     ):
         self.max_batch_size = max_batch_size
         self.total_num_pages = total_num_pages
@@ -57,87 +32,132 @@ class SharedBuffer:
 
         # Forward parameters
         # - prefill.begin_forward(..., num_qo_heads, num_kv_heads, head_dim, page_size)
-        # - decode.begin_forward(..., num_qo_heads, num_kv_heads, head_dim, page_size)
         self.num_qo_heads = num_qo_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
-        self.page_size = page_size
+        self.block_size = block_size
+        self.page_size = self.block_size
 
         # [shared] CUDA Graph capturable,
         # or may be replaced by BaseAttentionWrapper.get_cache_block().
-        self.kv_data = torch.randn(
-            total_num_pages, 2,
-            page_size,  # or `block_size`
-            num_kv_heads,
-            head_dim,
-            device=device,
-            dtype=torch.half
+        self.kv_data = kv_data
+        assert self.kv_data.shape == (
+            self.total_num_pages,
+            2,
+            self.block_size,
+            self.num_kv_heads,
+            self.head_dim,
         )
 
-        # [prefill]
-        self.prefill_workspace_buf = torch.empty(128 * MB, dtype=torch.uint8, device=device)
-        self.prefill_qo_indptr_buf = torch.empty(max_batch_size + 1, dtype=torch.int32, device=device)
-        self.prefill_paged_kv_indptr_buf = torch.empty(max_batch_size + 1, dtype=torch.int32, device=device)
-        self.prefill_paged_kv_indices_buf = torch.empty(total_num_pages, dtype=torch.int32, device=device)
-        self.prefill_paged_kv_last_page_len_buf = torch.empty(max_batch_size, dtype=torch.int32, device=device)
-        self.prefill_custom_mask_buf = torch.empty(
-            # TODO: I actually don't know if this size is correct...
-            max_batch_size, dtype=torch.int32, device=device
-        )
-        # mask = torch.tril(torch.full((qo_len, kv_len), True, device="cuda:0"), diagonal=(kv_len - qo_len))
-
-        self.prefill_qk_indptr_buf = torch.empty(max_batch_size + 1, dtype=torch.int32, device=device)
+        # Buffer
+        self.workspace_buf = torch.empty(128 * MB, dtype=torch.uint8, device=device)
+        self.qo_indptr_buf = torch.empty(max_batch_size + 1, dtype=torch.int32, device=device)
+        self.paged_kv_indptr_buf = torch.empty(max_batch_size + 1, dtype=torch.int32, device=device)
+        self.paged_kv_indices_buf = torch.empty(total_num_pages, dtype=torch.int32, device=device)
+        self.paged_kv_last_page_len_buf = torch.empty(max_batch_size, dtype=torch.int32, device=device)
+        self.qk_indptr_buf = torch.empty(max_batch_size + 1, dtype=torch.int32, device=device)
 
         # [prefill] CUDA Graph capturable
-        self.prefill_q = torch.randn(max_batch_size, num_qo_heads, head_dim, device=device, dtype=torch.half)
-        self.prefill_out = torch.empty_like(self.prefill_q)
-
-        # [decode]
-        self.decode_workspace_buf = torch.empty(128 * MB, dtype=torch.uint8, device=device)
-        self.decode_paged_kv_indptr_buffer = torch.empty(max_batch_size + 1, dtype=torch.int32, device=device)
-        self.decode_paged_kv_indices_buffer = torch.empty(total_num_pages, dtype=torch.int32, device=device)
-        self.decode_paged_kv_last_page_len_buffer = torch.empty(max_batch_size, dtype=torch.int32, device=device)
-
-        # [decode] CUDA Graph capturable
-        self.decode_q = torch.randn(max_batch_size, num_qo_heads, head_dim, device=device, dtype=torch.half)
-        self.decode_out = torch.empty_like(self.decode_q)
-
+        self.q = torch.randn(max_batch_size, num_qo_heads, head_dim, device=device, dtype=torch.half)
+        self.out = torch.empty_like(self.q)
         pass
 
-    def get_prefill_buffers(self, batch_size: int):
-        assert batch_size <= self.prefill_qo_indptr_buf.size(0) - 1
+    def get_wrapper_init_buffers(self, batch_size):
+        # class BatchPrefillWithPagedKVCacheWrapper:
+        #     def __init__(
+        #         self,
+        #         workspace_buffer: torch.Tensor,
+        #         kv_layout: str = "NHD",
+        #         use_cuda_graph: bool = False,
+        #         qo_indptr_buf: Optional[torch.Tensor] = None,
+        #         paged_kv_indptr_buf: Optional[torch.Tensor] = None,
+        #         paged_kv_indices_buf: Optional[torch.Tensor] = None,
+        #         paged_kv_last_page_len_buf: Optional[torch.Tensor] = None,
+        #         custom_mask_buf: Optional[torch.Tensor] = None,
+        #         qk_indptr_buf: Optional[torch.Tensor] = None,
+        #     ): ...
+
         return dict(
-            qo_indptr_buf=self.prefill_qo_indptr_buf[:batch_size + 1],
-            paged_kv_indptr_buf=self.prefill_paged_kv_indptr_buf[:batch_size + 1],
-            paged_kv_indices_buf=self.prefill_paged_kv_indices_buf,
-            paged_kv_last_page_len_buf=self.prefill_paged_kv_last_page_len_buf[:batch_size],
-            # custom_mask_buf=self.prefill_custom_mask_buf[:batch_size],
-            qk_indptr_buf=self.prefill_qk_indptr_buf[:batch_size + 1],
+            qo_indptr_buf=self.qo_indptr_buf[: batch_size + 1],
+            paged_kv_indptr_buf=self.paged_kv_indptr_buf[: batch_size + 1],
+            paged_kv_indices_buf=self.paged_kv_indices_buf,
+            paged_kv_last_page_len_buf=self.paged_kv_last_page_len_buf[: batch_size],
+            qk_indptr_buf=self.qk_indptr_buf[: batch_size + 1],
+            # qk_indptr_buf=self.qk_indptr_buf[: batch_size + 1],
         )
 
-    def get_decode_buffers(self, batch_size: int):
-        return dict(
-            paged_kv_indptr_buffer=self.decode_paged_kv_indptr_buffer[:batch_size + 1],
-            paged_kv_indices_buffer=self.decode_paged_kv_indices_buffer,
-            paged_kv_last_page_len_buffer=self.decode_paged_kv_last_page_len_buffer[:batch_size],
+    def get_q(self, batch_size):
+        return self.q[:batch_size]
+
+    def get_out(self, batch_size):
+        return self.out[:batch_size]
+
+
+class DecodeSharedBuffer:
+    def __init__(
+        self,
+        max_batch_size: int,
+        total_num_pages: int,
+        block_size: int,
+        num_kv_heads: int,
+        num_qo_heads: int,
+        head_dim: int,  # [64, 128, 256] according to flashinfer
+        device,
+        kv_data: torch.Tensor,
+    ):
+        self.max_batch_size = max_batch_size
+        self.total_num_pages = total_num_pages
+        self.device = device
+
+        # Forward parameters
+        # - prefill.begin_forward(..., num_qo_heads, num_kv_heads, head_dim, page_size)
+        self.num_qo_heads = num_qo_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.block_size = block_size
+        self.page_size = self.block_size
+
+        # [shared] CUDA Graph capturable,
+        # or may be replaced by BaseAttentionWrapper.get_cache_block().
+        self.kv_data = kv_data
+        assert self.kv_data.shape == (
+            self.total_num_pages,
+            2,
+            self.block_size,
+            self.num_kv_heads,
+            self.head_dim,
         )
 
-    def get_prefill_cuda_graph_capturable_tensors(self, batch_size: int):
-        assert batch_size <= self.max_batch_size
+        # Buffer
+        self.workspace_buf = torch.empty(128 * MB, dtype=torch.uint8, device=device)
+        self.paged_kv_indptr_buffer = torch.empty(max_batch_size + 1, dtype=torch.int32, device=device)
+        self.paged_kv_indices_buffer = torch.empty(total_num_pages, dtype=torch.int32, device=device)
+        self.paged_kv_last_page_len_buffer = torch.empty(max_batch_size, dtype=torch.int32, device=device)
+
+        # [prefill] CUDA Graph capturable
+        self.q = torch.randn(max_batch_size, num_qo_heads, head_dim, device=device, dtype=torch.half)
+        self.out = torch.empty_like(self.q)
+        pass
+
+    def get_wrapper_init_buffers(self, batch_size):
+        # class BatchDecodeWithPagedKVCacheWrapper:
+        #     def __init__(
+        #         self,
+        #         workspace_buffer: torch.Tensor,
+        #         kv_layout: str = "NHD",
+        #         use_cuda_graph: bool = False,
+        #         use_tensor_cores: bool = False,
+        #         paged_kv_indptr_buffer: Optional[torch.Tensor] = None,
+        #         paged_kv_indices_buffer: Optional[torch.Tensor] = None,
+        #         paged_kv_last_page_len_buffer: Optional[torch.Tensor] = None,
+        #     ):
         return dict(
-            q=self.prefill_q[:batch_size],
-            paged_kv_data=self.kv_data,
-            output=self.prefill_out[:batch_size],
+            paged_kv_indptr_buffer=self.paged_kv_indptr_buffer[: batch_size + 1],
+            paged_kv_indices_buffer=self.paged_kv_indices_buffer,
+            paged_kv_last_page_len_buffer=self.paged_kv_last_page_len_buffer[: batch_size],
         )
 
-    def get_decode_cuda_graph_capturable_tensors(self, batch_size: int):
-        assert batch_size <= self.max_batch_size
-        return dict(
-            q=self.decode_q[:batch_size],
-            paged_kv_data=self.kv_data,
-            output=self.decode_out[:batch_size],
-        )
-
+    pass
 
 class CUDAGraphAttentionWrapper(BaseAttentionWrapper):
     _inst = None
