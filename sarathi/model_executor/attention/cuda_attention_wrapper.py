@@ -164,7 +164,6 @@ class PrefillStageCUDAWrapper(BaseAttentionWrapper):
 
     def __init__(
         self, model_config: ModelConfig, parallel_config: ParallelConfig,
-        is_sub_stage: bool = False,  # has a higher stage that contains this wrapper
     ):
         super().__init__(model_config, parallel_config)
 
@@ -173,15 +172,12 @@ class PrefillStageCUDAWrapper(BaseAttentionWrapper):
         self.wrappers = None
         self.graphs = None
 
-        self.is_sub_stage = is_sub_stage
         self.active_wrapper = None
         self.active_graph = None
         self.is_metadata_initialized = False
         self.is_profiling_iteration = False
         self.contains_prefill = False
         self.num_prefill_tokens = 0
-        # self.contains_decode = False
-        # self.num_total_tokens = 0
 
         self.append_qo_indptr_tensor = None
         self.append_kv_page_indices_tensor = None
@@ -216,7 +212,7 @@ class PrefillStageCUDAWrapper(BaseAttentionWrapper):
 
         self.wrappers = {0: None}
 
-        # TODO: Think about what are the possible combinations we want
+        # TODO: Think about what are the possible batch sizes we want
         for batch_size in range(1, max_batch_size + 1):
             self.wrappers[batch_size] = BatchPrefillWithPagedKVCacheWrapper(
                 self.shared_buffer.workspace_buf, "NHD",
@@ -231,6 +227,7 @@ class PrefillStageCUDAWrapper(BaseAttentionWrapper):
         return self.wrappers[batch_size]
 
     def _begin_forward__init_cuda_graph(self, wrapper: BatchPrefillWithPagedKVCacheWrapper, batch_size: int, ):
+        """Helper method for init_cuda_graph"""
         total_num_pages = batch_size
         block_size = self.block_size
 
@@ -249,7 +246,7 @@ class PrefillStageCUDAWrapper(BaseAttentionWrapper):
         pass
 
     def init_cuda_graphs(self, pos_encoding_mode="NONE", softmax_scale=1.0):
-        # CUDA Graphs for prefill.
+        """Initialize CUDA graphs for this prefill stage CUDA wrapper."""
         self.graphs = {0: None}
 
         max_batch_size = self.max_batch_size
@@ -262,27 +259,12 @@ class PrefillStageCUDAWrapper(BaseAttentionWrapper):
                 o[:] = wrapper.forward(
                     self.shared_buffer.get_q(batch_size),
                     self.shared_buffer.kv_data,
-                    pos_encoding_mode=pos_encoding_mode,  # TODO: Dangling control vars
+                    pos_encoding_mode=pos_encoding_mode,
                     sm_scale=softmax_scale,
                 )
             self.end_forward()
             pass
         pass
-
-    def end_forward(self):
-        self.append_qo_indptr_tensor = None
-        self.append_kv_page_indices_tensor = None
-        self.append_kv_page_indptr_tensor = None
-        self.append_kv_last_page_len_tensor = None
-
-        self.is_metadata_initialized = False
-        self.num_prefill_tokens = 0
-        self.contains_prefill = False
-        if not self.active_wrapper:
-            return
-        self.active_wrapper.end_forward()
-        self.active_wrapper = None
-        return
 
     def begin_forward(
         self,
@@ -361,19 +343,33 @@ class PrefillStageCUDAWrapper(BaseAttentionWrapper):
                 self.block_size,
             )
 
-        if not self.is_sub_stage:
-            self.append_qo_indptr_tensor = self.to_int_tensor(
-                prefill_qo_indptr[:-1]
-            )
-            self.append_kv_page_indices_tensor = self.to_int_tensor(
-                prefill_kv_page_indices
-            )
-            self.append_kv_page_indptr_tensor = self.to_int_tensor(
-                prefill_kv_page_indptr[:-1]
-            )
-            self.append_kv_last_page_len_tensor = self.to_int_tensor(
-                prefill_kv_last_page_len
-            )
+        self.append_qo_indptr_tensor = self.to_int_tensor(
+            prefill_qo_indptr[:-1]
+        )
+        self.append_kv_page_indices_tensor = self.to_int_tensor(
+            prefill_kv_page_indices
+        )
+        self.append_kv_page_indptr_tensor = self.to_int_tensor(
+            prefill_kv_page_indptr[:-1]
+        )
+        self.append_kv_last_page_len_tensor = self.to_int_tensor(
+            prefill_kv_last_page_len
+        )
+        return
+
+    def end_forward(self):
+        self.append_qo_indptr_tensor = None
+        self.append_kv_page_indices_tensor = None
+        self.append_kv_page_indptr_tensor = None
+        self.append_kv_last_page_len_tensor = None
+
+        self.is_metadata_initialized = False
+        self.num_prefill_tokens = 0
+        self.contains_prefill = False
+        if not self.active_wrapper:
+            return
+        self.active_wrapper.end_forward()
+        self.active_wrapper = None
         return
 
     def forward(
@@ -384,13 +380,18 @@ class PrefillStageCUDAWrapper(BaseAttentionWrapper):
         kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         softmax_scale: float = 1.0,
         layer_id: Optional[int] = None,
+        use_cuda: bool = False,
     ) -> torch.Tensor:
+
+        if not use_cuda:
+            return self.forward_normal(query, key, value, kv_cache, softmax_scale, layer_id)
+        return self.forward_cuda(query, key, value, kv_cache, softmax_scale, layer_id)
+
+    def forward_cuda(self, query, key, value, kv_cache, softmax_scale, layer_id):
         assert self.is_metadata_initialized, "Metadata is not initialized."
         if self.is_profiling_iteration:
             # there is no need to call attention in profiling mode
             return torch.zeros_like(query)
-
-        # Called as an entry point
 
         with self.get_timer(OperationMetrics.ATTN_KV_CACHE_SAVE, layer_id):
             append_paged_kv_cache(
@@ -403,9 +404,7 @@ class PrefillStageCUDAWrapper(BaseAttentionWrapper):
                 self.append_kv_last_page_len_tensor,
                 kv_layout="NHD",
             )
-        pass
 
-    def forward_cuda(self, query, key, value, kv_cache, softmax_scale, layer_id):
         with self.get_timer(OperationMetrics.ATTN_PREFILL, layer_id):
             graph = self.active_graph
             batch_size = self.num_prefill_tokens
@@ -419,4 +418,53 @@ class PrefillStageCUDAWrapper(BaseAttentionWrapper):
         return o
 
     def forward_normal(self, query, key, value, kv_cache, softmax_scale, layer_id):
-        raise NotImplementedError("easy")
+        """Forward pass without CUDA graph."""
+        assert self.is_metadata_initialized, "Metadata is not initialized."
+        if self.is_profiling_iteration:
+            # there is no need to call attention in profiling mode
+            return torch.zeros_like(query)
+
+        with self.get_timer(OperationMetrics.ATTN_KV_CACHE_SAVE, layer_id):
+            append_paged_kv_cache(
+                key,
+                value,
+                self.append_qo_indptr_tensor,
+                kv_cache,
+                self.append_kv_page_indices_tensor,
+                self.append_kv_page_indptr_tensor,
+                self.append_kv_last_page_len_tensor,
+                kv_layout="NHD",
+            )
+
+        with self.get_timer(OperationMetrics.ATTN_INPUT_RESHAPE, layer_id):
+            query = query.contiguous().reshape(-1, self.num_q_heads, self.head_dim)
+            key = key.contiguous().reshape(-1, self.num_kv_heads, self.head_dim)
+            value = value.contiguous().reshape(-1, self.num_kv_heads, self.head_dim)
+
+        output = torch.empty_like(query)
+
+        with self.get_timer(OperationMetrics.ATTN_KV_CACHE_SAVE, layer_id):
+            append_paged_kv_cache(
+                key,
+                value,
+                self.append_qo_indptr_tensor,
+                kv_cache,
+                self.append_kv_page_indices_tensor,
+                self.append_kv_page_indptr_tensor,
+                self.append_kv_last_page_len_tensor,
+                kv_layout="NHD",
+            )
+
+        with self.get_timer(OperationMetrics.ATTN_PREFILL, layer_id):
+            if self.contains_prefill:
+                output[: self.num_prefill_tokens] = self.active_wrapper.forward(
+                    query[: self.num_prefill_tokens],
+                    kv_cache,
+                    pos_encoding_mode="NONE",
+                    sm_scale=softmax_scale,
+                )
+
+        with self.get_timer(OperationMetrics.ATTN_OUTPUT_RESHAPE, layer_id):
+            output = output.reshape(-1, self.num_q_heads * self.head_dim)
+
+        return output
