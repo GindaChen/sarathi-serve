@@ -169,11 +169,11 @@ class PrefillStageCUDAWrapper(BaseAttentionWrapper):
         super().__init__(model_config, parallel_config)
 
         self.max_batch_size = None
-        self.is_sub_stage = is_sub_stage
         self.shared_buffer = None
         self.wrappers = None
         self.graphs = None
 
+        self.is_sub_stage = is_sub_stage
         self.active_wrapper = None
         self.active_graph = None
         self.is_metadata_initialized = False
