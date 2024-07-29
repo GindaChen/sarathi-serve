@@ -159,57 +159,29 @@ class DecodeSharedBuffer:
 
     pass
 
-class CUDAGraphAttentionWrapper(BaseAttentionWrapper):
-    _inst = None
 
-    def init(
-        self,
-        model_config: ModelConfig,
-        parallel_config: ParallelConfig,
-        block_size: int,
-        device: torch.device,
-        max_batch_sizes: Iterable[int] = (128, 256, 512),
+class PrefillStageCUDAWrapper(BaseAttentionWrapper):
+
+    def __init__(
+        self, model_config: ModelConfig, parallel_config: ParallelConfig,
+        is_sub_stage: bool = False,  # has a higher stage that contains this wrapper
     ):
-        super().init(model_config, parallel_config, block_size, device)
+        super().__init__(model_config, parallel_config)
 
-        self.shared_buffer = SharedBuffer(
-            max_batch_size=max(max_batch_sizes),
-            page_size=block_size,
-            device=device,
-            total_num_pages=128,  # TODO: Get this from profiled kv cache
-            num_kv_heads=self.num_kv_heads,
-            num_qo_heads=self.num_q_heads,
-            head_dim=self.head_dim,
-        )
+        self.max_batch_size = None
+        self.is_sub_stage = is_sub_stage
+        self.shared_buffer = None
+        self.wrappers = None
+        self.graphs = None
 
-        self.prefill_wrappers = {0: None}
-        self.prefill_graph = {}
-        for batch_size in range(1, max(max_batch_sizes) + 1):
-            self.shared_buffer.get_prefill_buffers(batch_size)
-            wrapper = BatchPrefillWithPagedKVCacheWrapper(
-                self.shared_buffer.prefill_workspace_buf, "NHD",
-                use_cuda_graph=True,
-                **self.shared_buffer.get_prefill_buffers(batch_size),
-            )
-            self.prefill_wrappers[batch_size] = wrapper
-
-        self.decode_wrappers = {0: None}
-        self.decode_graph = {}
-        for batch_size in range(1, max(max_batch_sizes) + 1):
-            self.shared_buffer.get_decode_buffers(batch_size)
-            wrapper = BatchPrefillWithPagedKVCacheWrapper(
-                self.shared_buffer.decode_workspace_buf, "NHD",
-                use_cuda_graph=True,
-                **self.shared_buffer.get_decode_buffers(batch_size),
-            )
-            self.decode_wrappers[batch_size] = wrapper
-
+        self.active_wrapper = None
+        self.active_graph = None
         self.is_metadata_initialized = False
         self.is_profiling_iteration = False
         self.contains_prefill = False
-        self.contains_decode = False
         self.num_prefill_tokens = 0
-        self.num_total_tokens = 0
+        # self.contains_decode = False
+        # self.num_total_tokens = 0
 
         self.append_qo_indptr_tensor = None
         self.append_kv_page_indices_tensor = None
@@ -229,44 +201,100 @@ class CUDAGraphAttentionWrapper(BaseAttentionWrapper):
             **kwargs,
         )
 
-    def get_wrappers(self, prefill_batch_size, decode_batch_size):
-        # TODO: batch size may not be the right fit
-        return self.prefill_wrappers[prefill_batch_size], self.decode_wrappers[decode_batch_size]
+    def init_wrappers(self, max_batch_size, kv_data, total_num_pages, block_size):
+        self.max_batch_size = max_batch_size
+        self.shared_buffer = PrefillSharedBuffer(
+            max_batch_size=max_batch_size,
+            total_num_pages=total_num_pages,
+            block_size=block_size,
+            num_kv_heads=self.num_kv_heads,
+            num_qo_heads=self.num_q_heads,
+            head_dim=self.head_dim,
+            device=self.device,
+            kv_data=kv_data,
+        )
+
+        self.wrappers = {0: None}
+
+        # TODO: Think about what are the possible combinations we want
+        for batch_size in range(1, max_batch_size + 1):
+            self.wrappers[batch_size] = BatchPrefillWithPagedKVCacheWrapper(
+                self.shared_buffer.workspace_buf, "NHD",
+                use_cuda_graph=True,
+                **self.shared_buffer.get_wrapper_init_buffers(batch_size),
+            )
+            pass
+
+        return
+
+    def get_wrapper(self, batch_size):
+        return self.wrappers[batch_size]
+
+    def _begin_forward__init_cuda_graph(self, wrapper: BatchPrefillWithPagedKVCacheWrapper, batch_size: int, ):
+        total_num_pages = batch_size
+        block_size = self.block_size
+
+        prefill_qo_indptr = torch.arange(0, batch_size + 1).int()
+        prefill_kv_page_indptr = torch.arange(0, batch_size + 1).int()
+        prefill_kv_page_indices = torch.arange(0, total_num_pages).int()
+        prefill_kv_last_page_len = torch.full((batch_size,), block_size, dtype=torch.int32)
+        self._begin_forward(
+            wrapper,
+            batch_size,
+            prefill_qo_indptr.tolist(),
+            prefill_kv_page_indices.tolist(),
+            prefill_kv_page_indptr.tolist(),
+            prefill_kv_last_page_len.tolist(),
+        )
+        pass
+
+    def init_cuda_graphs(self, pos_encoding_mode="NONE", softmax_scale=1.0):
+        # CUDA Graphs for prefill.
+        self.graphs = {0: None}
+
+        max_batch_size = self.max_batch_size
+        for batch_size in range(1, max_batch_size + 1):
+            wrapper = self.wrappers[batch_size]
+            self._begin_forward__init_cuda_graph(wrapper, batch_size)
+            g = torch.cuda.CUDAGraph()
+            o = self.shared_buffer.get_out(batch_size),
+            with g.capture_state():
+                o[:] = wrapper.forward(
+                    self.shared_buffer.get_q(batch_size),
+                    self.shared_buffer.kv_data,
+                    pos_encoding_mode=pos_encoding_mode,  # TODO: Dangling control vars
+                    sm_scale=softmax_scale,
+                )
+            self.end_forward()
+            pass
+        pass
+
+    def end_forward(self):
+        self.append_qo_indptr_tensor = None
+        self.append_kv_page_indices_tensor = None
+        self.append_kv_page_indptr_tensor = None
+        self.append_kv_last_page_len_tensor = None
+
+        self.is_metadata_initialized = False
+        self.num_prefill_tokens = 0
+        self.contains_prefill = False
+        if not self.active_wrapper:
+            return
+        self.active_wrapper.end_forward()
+        self.active_wrapper = None
+        return
 
     def begin_forward(
         self,
         seq_metadata_list: List[SequenceMetadata],
     ) -> None:
-        # The indptr tensor captures the location query tokens in the input tensor.
-        # |<---------------------- num_valid_tokens ----------------------------------------------------->|
-        # |<--------------- num_prompt_tokens -------------->||<------- num_generation_tokens (M) ------->|
-        # |<--prompt_0-->|<--prompt_1-->|...|<--prompt_N-1-->||<--generation_0-->|...|<--generation_M-1-->|<--padding-->|
-        #
-        # Flashinfer calls this layout as a raggedtensor. The indptr tensor captures the start of each
-        # sequence in the ragged tensor. The length of the indptr tensor is the number of sequences + 1.
-        # We perform both prefill and decode attention in a single call to batched prefill kernel.
-        # prefill_qo_indptr: [0, prompt_0, prompt_0 + prompt_1, ..., prompt_0 + ... + prompt_N-1, generation_0, generation_0 + 1, ..., generation_0 + ... + M]
-        prefill_qo_indptr: List[int] = [0]
-        decode_qo_indptr: List[int] = [0]
-        # The kv_page_indices tensor captures the pages of the key-value cache that
-        # are assigned to each token in the input tensor. Since there is a variable number
-        # of pages assigned to each sequence, a ragged tensor to represent this.
-        prefill_kv_page_indices: List[int] = []
-        decode_kv_page_indices: List[int] = []
-        # the last page might not be full, so we need to keep track of the length of the last page
-        prefill_kv_last_page_len: List[int] = []
-        decode_kv_last_page_len: List[int] = []
-        # Since the prefill_kv_page_indices tensor is a ragged tensor, we also need to keep track of the
-        # indptr tensor for the prefill_kv_page_indices tensor. This tensor captures the start of each sequence
-        # in the ragged tensor.
-        prefill_kv_page_indptr: List[int] = [0]
-        decode_kv_page_indptr: List[int] = [0]
+        assert self.active_wrapper is None
 
-        self.is_profiling_iteration = False
-        self.is_metadata_initialized = True
-
-        self.contains_prefill = False
-        self.contains_decode = False
+        # Find the prefill parts of the requests.
+        prefill_qo_indptr: List[int] = [0]  # (batch_size + 1)
+        prefill_kv_page_indices: List[int] = []  # (total_num_pages)
+        prefill_kv_last_page_len: List[int] = []  # (batch_size)
+        prefill_kv_page_indptr: List[int] = [0]  # (batch_size + 1)
 
         for seq_metadata in seq_metadata_list:
             if not seq_metadata.is_prompt:
@@ -279,14 +307,12 @@ class CUDAGraphAttentionWrapper(BaseAttentionWrapper):
                 #  We will just skip the attention computation for now.
                 return
 
-            self.contains_prefill = True
-
+            # Compute the number of query tokens to use.
             prompt_chunk_len = seq_metadata.prompt_chunk_len
             processed_prompt_len = seq_metadata.seq.get_num_prompt_tokens_processed()
             current_total_len = processed_prompt_len + prompt_chunk_len
-
-            # indptr for the prompt tokens in q/o tensor
             prefill_qo_indptr.append(prefill_qo_indptr[-1] + prompt_chunk_len)
+
             # Compute the kv page indices for the prompt tokens.
             num_blocks_in_use = (
                                     current_total_len + self.block_size - 1
@@ -299,32 +325,32 @@ class CUDAGraphAttentionWrapper(BaseAttentionWrapper):
                 current_total_len % self.block_size or self.block_size
             )
 
-        for seq_metadata in seq_metadata_list:
-            if seq_metadata.is_prompt:
-                continue
+        # Get the wrapper with the appropriate batch size
+        # TODO: (FIX) batch size should get to the appropriate quantile
+        batch_size = prefill_qo_indptr[-1]
+        wrapper = self.wrappers[batch_size]
 
-            if seq_metadata.block_table is None:
-                self.is_profiling_iteration = True
-                return
+        self._begin_forward(
+            wrapper,
+            batch_size,
+            prefill_qo_indptr,
+            prefill_kv_page_indices,
+            prefill_kv_page_indptr,
+            prefill_kv_last_page_len,
+        )
+        pass
 
-            self.contains_decode = True
+    def _begin_forward(self, wrapper, batch_size, prefill_qo_indptr, prefill_kv_page_indices, prefill_kv_page_indptr,
+                       prefill_kv_last_page_len):
 
-            context_len = seq_metadata.seq.get_len()
-            # indptr for the prompt tokens in q/o tensor
-            decode_qo_indptr.append(decode_qo_indptr[-1] + 1)
-            # Compute the kv page indices for the prompt tokens.
-            num_blocks_in_use = (context_len + self.block_size - 1) // self.block_size
-            decode_kv_page_indices.extend(seq_metadata.block_table[:num_blocks_in_use])
-            decode_kv_page_indptr.append(decode_kv_page_indptr[-1] + num_blocks_in_use)
-            decode_kv_last_page_len.append(
-                context_len % self.block_size or self.block_size
-            )
+        # Set stateful states.
+        self.is_metadata_initialized = True
+        self.num_prefill_tokens = prefill_qo_indptr[-1]
+        self.contains_prefill = batch_size > 0
+        self.active_wrapper = wrapper
 
-        prefill_batch_size = len(prefill_qo_indptr) - 1
-        decode_batch_size = len(decode_qo_indptr) - 1
-        prefill_wrapper, decode_wrapper = self.get_wrappers(prefill_batch_size, decode_batch_size)
         if self.contains_prefill:
-            prefill_wrapper.begin_forward(
+            wrapper.begin_forward(
                 self.to_int_tensor(prefill_qo_indptr),
                 self.to_int_tensor(prefill_kv_page_indptr),
                 self.to_int_tensor(prefill_kv_page_indices),
@@ -335,56 +361,62 @@ class CUDAGraphAttentionWrapper(BaseAttentionWrapper):
                 self.block_size,
             )
 
-        if self.contains_decode:
-            decode_wrapper.begin_forward(
-                self.to_int_tensor(decode_qo_indptr),
-                self.to_int_tensor(decode_kv_page_indptr),
-                self.to_int_tensor(decode_kv_page_indices),
-                self.to_int_tensor(decode_kv_last_page_len),
-                self.num_q_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                self.block_size,
+        if not self.is_sub_stage:
+            self.append_qo_indptr_tensor = self.to_int_tensor(
+                prefill_qo_indptr[:-1]
             )
-
-        self.num_prefill_tokens = prefill_qo_indptr[-1]
-        self.num_total_tokens = self.num_prefill_tokens + len(decode_qo_indptr) - 1
-
-        self.append_qo_indptr_tensor = self.to_int_tensor(
-            prefill_qo_indptr[:-1]
-            + [x + prefill_qo_indptr[-1] for x in decode_qo_indptr]
-        )
-        self.append_kv_page_indices_tensor = self.to_int_tensor(
-            prefill_kv_page_indices + decode_kv_page_indices
-        )
-        self.append_kv_page_indptr_tensor = self.to_int_tensor(
-            prefill_kv_page_indptr[:-1]
-            + [x + prefill_kv_page_indptr[-1] for x in decode_kv_page_indptr]
-        )
-        self.append_kv_last_page_len_tensor = self.to_int_tensor(
-            prefill_kv_last_page_len + decode_kv_last_page_len
-        )
-
-    def end_forward(self):
-        if self.contains_prefill:
-            self.prefill_wrapper.end_forward()
-
-        if self.contains_decode:
-            self.decode_wrapper.end_forward()
-
-        self.is_metadata_initialized = False
+            self.append_kv_page_indices_tensor = self.to_int_tensor(
+                prefill_kv_page_indices
+            )
+            self.append_kv_page_indptr_tensor = self.to_int_tensor(
+                prefill_kv_page_indptr[:-1]
+            )
+            self.append_kv_last_page_len_tensor = self.to_int_tensor(
+                prefill_kv_last_page_len
+            )
+        return
 
     def forward(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        kv_cache: torch.Tensor,
+        kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         softmax_scale: float = 1.0,
         layer_id: Optional[int] = None,
     ) -> torch.Tensor:
         assert self.is_metadata_initialized, "Metadata is not initialized."
-
         if self.is_profiling_iteration:
             # there is no need to call attention in profiling mode
             return torch.zeros_like(query)
+
+        # Called as an entry point
+
+        with self.get_timer(OperationMetrics.ATTN_KV_CACHE_SAVE, layer_id):
+            append_paged_kv_cache(
+                key,
+                value,
+                self.append_qo_indptr_tensor,
+                kv_cache,
+                self.append_kv_page_indices_tensor,
+                self.append_kv_page_indptr_tensor,
+                self.append_kv_last_page_len_tensor,
+                kv_layout="NHD",
+            )
+        pass
+
+    def forward_cuda(self, query, key, value, kv_cache, softmax_scale, layer_id):
+        with self.get_timer(OperationMetrics.ATTN_PREFILL, layer_id):
+            graph = self.active_graph
+            batch_size = self.num_prefill_tokens
+
+            q = self.shared_buffer.get_q(batch_size)
+            q[:] = query[:batch_size]
+
+            graph.replay()
+
+            o = self.shared_buffer.get_out(batch_size)
+        return o
+
+    def forward_normal(self, query, key, value, kv_cache, softmax_scale, layer_id):
+        raise NotImplementedError("easy")
