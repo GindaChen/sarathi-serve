@@ -393,6 +393,11 @@ class PrefillStageCUDAWrapper(BaseAttentionWrapper):
             # there is no need to call attention in profiling mode
             return torch.zeros_like(query)
 
+        with self.get_timer(OperationMetrics.ATTN_INPUT_RESHAPE, layer_id):
+            query = query.contiguous().reshape(-1, self.num_q_heads, self.head_dim)
+            key = key.contiguous().reshape(-1, self.num_kv_heads, self.head_dim)
+            value = value.contiguous().reshape(-1, self.num_kv_heads, self.head_dim)
+
         with self.get_timer(OperationMetrics.ATTN_KV_CACHE_SAVE, layer_id):
             append_paged_kv_cache(
                 key,
@@ -424,6 +429,13 @@ class PrefillStageCUDAWrapper(BaseAttentionWrapper):
             # there is no need to call attention in profiling mode
             return torch.zeros_like(query)
 
+        with self.get_timer(OperationMetrics.ATTN_INPUT_RESHAPE, layer_id):
+            query = query.contiguous().reshape(-1, self.num_q_heads, self.head_dim)
+            key = key.contiguous().reshape(-1, self.num_kv_heads, self.head_dim)
+            value = value.contiguous().reshape(-1, self.num_kv_heads, self.head_dim)
+
+        output = torch.empty_like(query)
+
         with self.get_timer(OperationMetrics.ATTN_KV_CACHE_SAVE, layer_id):
             append_paged_kv_cache(
                 key,
@@ -435,13 +447,6 @@ class PrefillStageCUDAWrapper(BaseAttentionWrapper):
                 self.append_kv_last_page_len_tensor,
                 kv_layout="NHD",
             )
-
-        with self.get_timer(OperationMetrics.ATTN_INPUT_RESHAPE, layer_id):
-            query = query.contiguous().reshape(-1, self.num_q_heads, self.head_dim)
-            key = key.contiguous().reshape(-1, self.num_kv_heads, self.head_dim)
-            value = value.contiguous().reshape(-1, self.num_kv_heads, self.head_dim)
-
-        output = torch.empty_like(query)
 
         with self.get_timer(OperationMetrics.ATTN_KV_CACHE_SAVE, layer_id):
             append_paged_kv_cache(
@@ -468,3 +473,5 @@ class PrefillStageCUDAWrapper(BaseAttentionWrapper):
             output = output.reshape(-1, self.num_q_heads * self.head_dim)
 
         return output
+
+
