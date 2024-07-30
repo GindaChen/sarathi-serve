@@ -10,16 +10,16 @@ from sarathi.metrics.constants import OperationMetrics
 from sarathi.model_executor.attention.base_attention_wrapper import BaseAttentionWrapper
 
 
-def copy_tensor_portion(source, target):
+def copy_tensor_portion(dst, src):
     """
     Copies the portion of the target tensor to the source tensor based on the shape of the target tensor.
 
     Args:
-        source (torch.Tensor): The tensor to copy to.
-        target (torch.Tensor): The tensor to copy from.
+        dst (torch.Tensor): The tensor to copy to.
+        src (torch.Tensor): The tensor to copy from.
     """
-    slices = tuple(slice(0, min(s, t)) for s, t in zip(source.shape, target.shape))
-    source[slices] = target[slices]
+    slices = tuple(slice(0, min(s, t)) for s, t in zip(dst.shape, src.shape))
+    dst[slices] = src[slices]
 
 
 @dataclasses.dataclass()
