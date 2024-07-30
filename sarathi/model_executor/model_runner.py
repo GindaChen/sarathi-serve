@@ -1,4 +1,5 @@
-from typing import List, Optional, Tuple
+import gc
+from typing import List, Optional, Tuple, Dict
 
 import torch
 import torch.distributed
@@ -32,12 +33,15 @@ class ModelRunner:
         self.rank = rank
 
         self.model = get_model(self.config.model_config)
-        get_attention_wrapper().init(
+        wrapper = get_attention_wrapper()
+        wrapper.init(
             config.model_config,
             config.parallel_config,
             config.cache_config.block_size,
             self.device,
         )
+        self.use_cuda_graph = wrapper.is_cuda_wrapper()
+        self.cuda_graphs: Dict[Tuple[int, int], 'torch.cuda.CUDAGraph'] = {}
 
         self.sampler: Optional[Sampler] = None
         if self.model.lm_head:
@@ -213,6 +217,56 @@ class ModelRunner:
         set_random_seed(self.config.model_config.seed)
         return num_gpu_blocks
 
+    def capture_cuda_graphs(
+        self,
+        gpu_cache: Optional[List[torch.Tensor]] = None,
+    ):
+        # TODO: Change the batch sizes to appropriate values...
+        _BATCH_SIZE_ALIGNMENT = 8
+        _BATCH_SIZES_TO_CAPTURE = [1, 2, 4] + [
+            _BATCH_SIZE_ALIGNMENT * i for i in range(1, 33)
+        ]
+
+        for prefill_batch_size in [1, 2, 4, 8]:
+            for decode_batch_size in [1, 2, 4, 8]:
+                # TODO: Get the appropriate sequence metadata list...
+                #   Create sequence metadata list with the given batch sizes.
+                #   Prepare `prefill_batch_size` number of sequence where each sequence has prompt len = 1,
+                #   and `decode_batch_size` number of sequence where each sequence has context len = 1.
+                seq_metadata_list = [...]
+
+                # Capture input_tokens and input_positions using what the buffer has prepared.
+                input_tokens, input_positions = self._prepare_inputs(seq_metadata_list)
+                buffer = get_attention_wrapper().buffer.prepare_sliced_buffer(prefill_batch_size, decode_batch_size)
+                buffer.prepare_buffer_bulk(dict(
+                    input_tokens=input_tokens,
+                    input_positions=input_positions,
+                ))
+                input_tokens, input_positions = buffer.input_tokens, buffer.input_positions
+
+                # Warm up...
+                _NUM_WARMUP_ITERS = 2
+                for _ in range(_NUM_WARMUP_ITERS):
+                    self.model(
+                        hidden_states=input_tokens,
+                        positions=input_positions,
+                        kv_caches=gpu_cache,
+                    )
+                torch.cuda.synchronize()
+
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    self.model(
+                        hidden_states=input_tokens,
+                        positions=input_positions,
+                        kv_caches=gpu_cache,
+                    )
+                    gc.collect()
+                torch.cuda.synchronize()
+
+    def get_cuda_graph(self, num_prefill_tokens, num_decode_tokens):
+        return self.cuda_graphs[(num_prefill_tokens, num_decode_tokens)]
+
     def run(
         self,
         seq_metadata_list: List[SequenceMetadata],
@@ -227,11 +281,25 @@ class ModelRunner:
         with self._model_execution_e2e_timer:
             # Execute the model.
             try:
-                output = self.model(
-                    hidden_states=input_tokens,
-                    positions=input_positions,
-                    kv_caches=gpu_cache,
-                )
+                if self.use_cuda_graph:
+                    wrapper = get_attention_wrapper()
+                    wrapper.buffer.prepare_buffer_bulk(dict(
+                        input_tokens=input_tokens,
+                        input_positions=input_positions,
+                    ))
+                    cuda_graph = self.get_cuda_graph(
+                        wrapper.num_prefill_tokens,
+                        wrapper.num_decode_tokens
+                    )
+                    cuda_graph.replay()
+                    output = wrapper.get_output()
+                else:
+                    output = self.model(
+                        hidden_states=input_tokens,
+                        positions=input_positions,
+                        kv_caches=gpu_cache,
+                    )
+
             except RuntimeError as e:
                 logger.error(
                     f"RuntimeError: {e} for seq_metadata_list: {seq_metadata_list}"
