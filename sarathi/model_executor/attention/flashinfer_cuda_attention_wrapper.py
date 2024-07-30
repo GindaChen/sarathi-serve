@@ -404,6 +404,8 @@ class FlashinferCUDAAttentionWrapper(BaseAttentionWrapper):
                 context_len % self.block_size or self.block_size
             )
 
+        assert not self.is_profiling_iteration, f"prefill and decode wrapper is not set during profiling."
+
         self.num_prefill_tokens = prefill_qo_indptr[-1]
         self.num_total_tokens = self.num_prefill_tokens + len(decode_qo_indptr) - 1
         self.num_decode_tokens = self.num_total_tokens - self.num_prefill_tokens
