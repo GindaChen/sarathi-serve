@@ -235,6 +235,88 @@ class FlashinferCUDAAttentionWrapper(BaseAttentionWrapper):
             **kwargs,
         )
 
+    def begin_forward_for_capture(
+        self, prefill_batch_size, decode_batch_size,
+    ):
+        # TODO: (Hack) Only support aligned batch size of 8.
+        # TODO: (Refactor) Duplicate code with begin_forward(),
+        # TODO: Pad request if the batch size is not multiple of 8, but let's live with it for now.
+        aligned_size = 8
+        assert prefill_batch_size % aligned_size == 0, f"begin_forward_for_capture() fixed the size to align"
+        assert decode_batch_size % aligned_size == 0, f"begin_forward_for_capture() fixed the size to align"
+
+        num_prefill_requests = prefill_batch_size // aligned_size
+        num_decode_requests = decode_batch_size
+
+        # Hacked
+        prefill_qo_indptr = [0] + [aligned_size * i for i in range(1, num_prefill_requests + 1)]
+        prefill_kv_page_indices = [0] + [i for i in range(1, num_prefill_requests + 1)]
+        prefill_kv_page_indptr = [0] + [i for i in range(1, num_prefill_requests + 1)]
+        prefill_kv_last_page_len = [self.block_size] * num_prefill_requests
+
+        decode_qo_indptr = [0] + [i for i in range(1, num_decode_requests + 1)]
+        decode_kv_page_indices = [0] + [i for i in range(1, num_decode_requests + 1)]
+        decode_kv_page_indptr = [0] + [i for i in range(1, num_decode_requests + 1)]
+        decode_kv_last_page_len = [1] * num_decode_requests
+
+        self.is_profiling_iteration = False
+        self.is_metadata_initialized = True
+
+        self.contains_prefill = False
+        self.contains_decode = False
+
+        self.num_prefill_tokens = prefill_qo_indptr[-1]
+        self.num_total_tokens = self.num_prefill_tokens + len(decode_qo_indptr) - 1
+        self.num_decode_tokens = self.num_total_tokens - self.num_prefill_tokens
+
+        self.prefill_wrapper = self._prefill_wrappers[self.num_prefill_tokens]
+        self.decode_wrapper = self._decode_wrappers[self.num_decode_tokens]
+
+        if self.contains_prefill:
+            self.prefill_wrapper.begin_forward(
+                self.to_int_tensor(prefill_qo_indptr),
+                self.to_int_tensor(prefill_kv_page_indptr),
+                self.to_int_tensor(prefill_kv_page_indices),
+                self.to_int_tensor(prefill_kv_last_page_len),
+                self.num_q_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.block_size,
+            )
+
+        if self.contains_decode:
+            self.decode_wrapper.begin_forward(
+                self.to_int_tensor(decode_qo_indptr),
+                self.to_int_tensor(decode_kv_page_indptr),
+                self.to_int_tensor(decode_kv_page_indices),
+                self.to_int_tensor(decode_kv_last_page_len),
+                self.num_q_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.block_size,
+            )
+
+        append_qo_indptr_tensor = prefill_qo_indptr[:-1] + [x + prefill_qo_indptr[-1] for x in decode_qo_indptr]
+        append_kv_page_indices_tensor = prefill_kv_page_indices + decode_kv_page_indices
+        append_kv_page_indptr_tensor = prefill_kv_page_indptr[:-1] + [x + prefill_kv_page_indptr[-1] for x in
+                                                                      decode_kv_page_indptr]
+        append_kv_last_page_len_tensor = prefill_kv_last_page_len + decode_kv_last_page_len
+
+        # Assign the value to captured tensor.
+        self.append_qo_indptr_tensor[:len(append_qo_indptr_tensor)] = self.to_int_tensor(
+            append_qo_indptr_tensor
+        )
+        self.append_kv_page_indices_tensor[:len(append_kv_page_indices_tensor)] = self.to_int_tensor(
+            append_kv_page_indices_tensor
+        )
+        self.append_kv_page_indptr_tensor[:len(append_kv_page_indptr_tensor)] = self.to_int_tensor(
+            append_kv_page_indptr_tensor
+        )
+        self.append_kv_last_page_len_tensor[:len(append_kv_last_page_len_tensor)] = self.to_int_tensor(
+            append_kv_last_page_len_tensor
+        )
+        return
+
     def begin_forward(
         self,
         seq_metadata_list: List[SequenceMetadata],
@@ -372,7 +454,6 @@ class FlashinferCUDAAttentionWrapper(BaseAttentionWrapper):
         self.append_kv_last_page_len_tensor[:len(append_kv_last_page_len_tensor)] = self.to_int_tensor(
             append_kv_last_page_len_tensor
         )
-
 
     def end_forward(self):
         self.is_metadata_initialized = False

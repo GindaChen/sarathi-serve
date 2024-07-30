@@ -227,22 +227,26 @@ class ModelRunner:
             _BATCH_SIZE_ALIGNMENT * i for i in range(1, 33)
         ]
 
-        for prefill_batch_size in [1, 2, 4, 8]:
-            for decode_batch_size in [1, 2, 4, 8]:
+        for prefill_batch_size in [8, 16, 32]:
+            for decode_batch_size in [8, 16, ]:
                 # TODO: Get the appropriate sequence metadata list...
                 #   Create sequence metadata list with the given batch sizes.
-                #   Prepare `prefill_batch_size` number of sequence where each sequence has prompt len = 1,
+                #   Prepare `prefill_batch_size` with 1 request with context len = `prefill_batch_size`
                 #   and `decode_batch_size` number of sequence where each sequence has context len = 1.
-                seq_metadata_list = [...]
 
                 # Capture input_tokens and input_positions using what the buffer has prepared.
-                input_tokens, input_positions = self._prepare_inputs(seq_metadata_list)
+                batch_size = prefill_batch_size + decode_batch_size
+                input_tokens = torch.tensor([i for i in range(batch_size)], dtype=torch.long, device=self.device)
+                input_positions = torch.tensor([i for i in range(batch_size)], dtype=torch.long, device=self.device)
                 buffer = get_attention_wrapper().buffer.prepare_sliced_buffer(prefill_batch_size, decode_batch_size)
                 buffer.prepare_buffer_bulk(dict(
                     input_tokens=input_tokens,
                     input_positions=input_positions,
                 ))
-                input_tokens, input_positions = buffer.input_tokens, buffer.input_positions
+
+                # Get the wrapper prepared
+                wrapper = get_attention_wrapper()
+                wrapper.begin_forward_for_capture(prefill_batch_size, decode_batch_size)
 
                 # Warm up...
                 _NUM_WARMUP_ITERS = 2
@@ -263,6 +267,8 @@ class ModelRunner:
                     )
                     gc.collect()
                 torch.cuda.synchronize()
+
+                wrapper.end_forward()
 
     def get_cuda_graph(self, num_prefill_tokens, num_decode_tokens):
         return self.cuda_graphs[(num_prefill_tokens, num_decode_tokens)]
