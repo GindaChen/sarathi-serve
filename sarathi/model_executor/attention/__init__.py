@@ -4,6 +4,7 @@ from typing import Union
 from sarathi.model_executor.attention.flashinfer_attention_wrapper import (
     FlashinferAttentionWrapper,
 )
+from sarathi.model_executor.attention.flashinfer_cuda_attention_wrapper import FlashinferCUDAAttentionWrapper
 from sarathi.model_executor.attention.no_op_attention_wrapper import (
     NoOpAttentionWrapper,
 )
@@ -25,9 +26,14 @@ def set_attention_backend(backend: Union[str, AttentionBackend]):
     ATTENTION_BACKEND = backend
 
 
+def is_cuda_wrapper():
+    return ATTENTION_BACKEND == AttentionBackend.FLASHINFER_CUDA
+
 def get_attention_wrapper():
     if ATTENTION_BACKEND == AttentionBackend.FLASHINFER:
         return FlashinferAttentionWrapper.get_instance()
+    elif ATTENTION_BACKEND == AttentionBackend.FLASHINFER_CUDA:
+        return FlashinferCUDAAttentionWrapper.get_instance()
     elif ATTENTION_BACKEND == AttentionBackend.NO_OP:
         return NoOpAttentionWrapper.get_instance()
 
