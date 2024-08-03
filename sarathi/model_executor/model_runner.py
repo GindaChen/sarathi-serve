@@ -42,6 +42,7 @@ class ModelRunner:
         )
         self.use_cuda_graph = is_cuda_wrapper()
         self.cuda_graphs: Dict[int, 'torch.cuda.CUDAGraph'] = {}
+        self.cuda_graphs_output: Dict[int, 'torch.Tensor'] = {}
 
         self.sampler: Optional[Sampler] = None
         if self.model.lm_head:
@@ -226,7 +227,7 @@ class ModelRunner:
         pass
 
     def get_cuda_graph(self, batch_size: int):
-        return self.cuda_graphs[batch_size]
+        return self.cuda_graphs.get(batch_size, None)
 
     def run(
         self,
@@ -237,14 +238,15 @@ class ModelRunner:
         with self._prepare_inputs_e2e_timer:
             input_tokens, input_positions = self._prepare_inputs(seq_metadata_list)
 
-        get_attention_wrapper().begin_forward(seq_metadata_list)
+        wrapper = get_attention_wrapper()
+        wrapper.begin_forward(seq_metadata_list)
 
         batch_size = len(seq_metadata_list)
         with self._model_execution_e2e_timer:
             # Execute the model.
             try:
                 if self.use_cuda_graph:
-                    wrapper = get_attention_wrapper()
+                    # Prepare the CUDA graph captured buffer
                     wrapper.buffer.prepare_buffer_bulk(dict(
                         input_tokens=input_tokens,
                         input_positions=input_positions,
@@ -253,8 +255,16 @@ class ModelRunner:
                     cuda_graph = self.get_cuda_graph(
                         batch_size=batch_size
                     )
+                    if cuda_graph is None:
+                        cuda_graph, output = self.capture_cuda_graph(
+                            input_tokens, input_positions, gpu_cache,
+                        )
+                        self.cuda_graphs[batch_size] = cuda_graph
+                        self.cuda_graphs_output[batch_size] = output
+                        pass
+
                     cuda_graph.replay()
-                    output = wrapper.get_output()
+                    output = self.cuda_graphs_output[batch_size]
                 else:
                     output = self.model(
                         hidden_states=input_tokens,
@@ -275,3 +285,27 @@ class ModelRunner:
         get_attention_wrapper().end_forward()
 
         return output
+
+    def capture_cuda_graph(
+        self, input_tokens, input_positions, gpu_cache
+    ) -> Tuple['torch.cuda.CUDAGraph', 'torch.Tensor']:
+        """
+        Capture the CUDA graph for the model execution.
+
+        Args:
+            input_tokens: The input tokens tensor.
+            input_positions: The input positions tensor.
+            gpu_cache: The GPU cache tensor.
+
+        Returns:
+            The captured CUDA graph and the model output.
+        """
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = self.model(
+                hidden_states=input_tokens,
+                positions=input_positions,
+                kv_caches=gpu_cache,
+            )
+            pass
+        return graph, output
