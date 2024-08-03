@@ -175,17 +175,11 @@ class FlashinferCUDAAttentionWrapper(BaseAttentionWrapper):
         self.num_decode_tokens = 0
         self.num_total_tokens = 0
 
-        prefill_workspace_buffer = torch.empty(
+        workspace_buffer = torch.empty(
             128 * 1024 * 1024, dtype=torch.uint8, device=device
         )
-        decode_workspace_buffer = torch.empty(
-            128 * 1024 * 1024, dtype=torch.uint8, device=device
-        )
-        self.prefill_wrapper = self.default_prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
-            prefill_workspace_buffer, "NHD"
-        )
-        self.decode_wrapper = self.default_decode_wrapper = BatchPrefillWithPagedKVCacheWrapper(
-            decode_workspace_buffer, "NHD"
+        self.wrapper = self.default_wrapper = BatchPrefillWithPagedKVCacheWrapper(
+            workspace_buffer, "NHD"
         )
 
         self.buffer = SharedBuffer(
@@ -202,24 +196,14 @@ class FlashinferCUDAAttentionWrapper(BaseAttentionWrapper):
         # TODO: Tweak the appropriate batch size..
         batch_size_to_sample = list(range(1, 1024 + 1))
 
-        self._prefill_wrappers = {0: None}
+        self._wrappers = {0: None}
         for batch_size in batch_size_to_sample:
             buffer = self.buffer.prepare_sliced_buffer(batch_size, 0)
             wrapper = BatchPrefillWithPagedKVCacheWrapper(
-                prefill_workspace_buffer, "NHD",
+                workspace_buffer, "NHD",
                 **buffer.get_prefill_buf()
             )
-            self._prefill_wrappers[batch_size] = wrapper
-            pass
-
-        self._decode_wrappers = {0: None}
-        for batch_size in batch_size_to_sample:
-            buffer = self.buffer.prepare_sliced_buffer(0, batch_size)
-            wrapper = BatchPrefillWithPagedKVCacheWrapper(
-                decode_workspace_buffer, "NHD",
-                **buffer.get_decode_buf()
-            )
-            self._decode_wrappers[batch_size] = wrapper
+            self._wrappers[batch_size] = wrapper
             pass
 
     def to_int_tensor(self, data: List[int]) -> torch.Tensor:
@@ -235,116 +219,14 @@ class FlashinferCUDAAttentionWrapper(BaseAttentionWrapper):
             **kwargs,
         )
 
-    def begin_forward_for_capture(
-        self, prefill_batch_size, decode_batch_size,
-    ):
-        # TODO: (Hack) Only support aligned batch size of 8.
-        # TODO: (Refactor) Duplicate code with begin_forward(),
-        # TODO: Pad request if the batch size is not multiple of 8, but let's live with it for now.
-        aligned_size = 8
-        assert prefill_batch_size % aligned_size == 0, f"begin_forward_for_capture() fixed the size to align"
-        assert decode_batch_size % aligned_size == 0, f"begin_forward_for_capture() fixed the size to align"
-
-        num_prefill_requests = prefill_batch_size // aligned_size
-        num_decode_requests = decode_batch_size
-
-        # Hacked
-        prefill_qo_indptr = [0] + [aligned_size * i for i in range(1, num_prefill_requests + 1)]
-        prefill_kv_page_indices = [0] + [i for i in range(1, num_prefill_requests + 1)]
-        prefill_kv_page_indptr = [0] + [i for i in range(1, num_prefill_requests + 1)]
-        prefill_kv_last_page_len = [self.block_size] * num_prefill_requests
-
-        decode_qo_indptr = [0] + [i for i in range(1, num_decode_requests + 1)]
-        decode_kv_page_indices = [0] + [i for i in range(1, num_decode_requests + 1)]
-        decode_kv_page_indptr = [0] + [i for i in range(1, num_decode_requests + 1)]
-        decode_kv_last_page_len = [1] * num_decode_requests
-
-        self.is_profiling_iteration = False
-        self.is_metadata_initialized = True
-
-        self.contains_prefill = False
-        self.contains_decode = False
-
-        self.num_prefill_tokens = prefill_qo_indptr[-1]
-        self.num_total_tokens = self.num_prefill_tokens + len(decode_qo_indptr) - 1
-        self.num_decode_tokens = self.num_total_tokens - self.num_prefill_tokens
-
-        self.prefill_wrapper = self._prefill_wrappers[self.num_prefill_tokens]
-        self.decode_wrapper = self._decode_wrappers[self.num_decode_tokens]
-
-        if self.contains_prefill:
-            self.prefill_wrapper.begin_forward(
-                self.to_int_tensor(prefill_qo_indptr),
-                self.to_int_tensor(prefill_kv_page_indptr),
-                self.to_int_tensor(prefill_kv_page_indices),
-                self.to_int_tensor(prefill_kv_last_page_len),
-                self.num_q_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                self.block_size,
-            )
-
-        if self.contains_decode:
-            self.decode_wrapper.begin_forward(
-                self.to_int_tensor(decode_qo_indptr),
-                self.to_int_tensor(decode_kv_page_indptr),
-                self.to_int_tensor(decode_kv_page_indices),
-                self.to_int_tensor(decode_kv_last_page_len),
-                self.num_q_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                self.block_size,
-            )
-
-        append_qo_indptr_tensor = prefill_qo_indptr[:-1] + [x + prefill_qo_indptr[-1] for x in decode_qo_indptr]
-        append_kv_page_indices_tensor = prefill_kv_page_indices + decode_kv_page_indices
-        append_kv_page_indptr_tensor = prefill_kv_page_indptr[:-1] + [x + prefill_kv_page_indptr[-1] for x in
-                                                                      decode_kv_page_indptr]
-        append_kv_last_page_len_tensor = prefill_kv_last_page_len + decode_kv_last_page_len
-
-        # Assign the value to captured tensor.
-        self.append_qo_indptr_tensor[:len(append_qo_indptr_tensor)] = self.to_int_tensor(
-            append_qo_indptr_tensor
-        )
-        self.append_kv_page_indices_tensor[:len(append_kv_page_indices_tensor)] = self.to_int_tensor(
-            append_kv_page_indices_tensor
-        )
-        self.append_kv_page_indptr_tensor[:len(append_kv_page_indptr_tensor)] = self.to_int_tensor(
-            append_kv_page_indptr_tensor
-        )
-        self.append_kv_last_page_len_tensor[:len(append_kv_last_page_len_tensor)] = self.to_int_tensor(
-            append_kv_last_page_len_tensor
-        )
-        return
-
     def begin_forward(
         self,
         seq_metadata_list: List[SequenceMetadata],
     ) -> None:
-        # The indptr tensor captures the location query tokens in the input tensor.
-        # |<---------------------- num_valid_tokens ----------------------------------------------------->|
-        # |<--------------- num_prompt_tokens -------------->||<------- num_generation_tokens (M) ------->|
-        # |<--prompt_0-->|<--prompt_1-->|...|<--prompt_N-1-->||<--generation_0-->|...|<--generation_M-1-->|<--padding-->|
-        #
-        # Flashinfer calls this layout as a raggedtensor. The indptr tensor captures the start of each
-        # sequence in the ragged tensor. The length of the indptr tensor is the number of sequences + 1.
-        # We perform both prefill and decode attention in a single call to batched prefill kernel.
-        # prefill_qo_indptr: [0, prompt_0, prompt_0 + prompt_1, ..., prompt_0 + ... + prompt_N-1, generation_0, generation_0 + 1, ..., generation_0 + ... + M]
-        prefill_qo_indptr: List[int] = [0]
-        decode_qo_indptr: List[int] = [0]
-        # The kv_page_indices tensor captures the pages of the key-value cache that
-        # are assigned to each token in the input tensor. Since there is a variable number
-        # of pages assigned to each sequence, a ragged tensor to represent this.
-        prefill_kv_page_indices: List[int] = []
-        decode_kv_page_indices: List[int] = []
-        # the last page might not be full, so we need to keep track of the length of the last page
-        prefill_kv_last_page_len: List[int] = []
-        decode_kv_last_page_len: List[int] = []
-        # Since the prefill_kv_page_indices tensor is a ragged tensor, we also need to keep track of the
-        # indptr tensor for the prefill_kv_page_indices tensor. This tensor captures the start of each sequence
-        # in the ragged tensor.
-        prefill_kv_page_indptr: List[int] = [0]
-        decode_kv_page_indptr: List[int] = [0]
+        qo_indptr: List[int] = [0]
+        kv_page_indices: List[int] = []
+        kv_last_page_len: List[int] = []
+        kv_page_indptr: List[int] = [0]
 
         self.is_profiling_iteration = False
         self.is_metadata_initialized = True
@@ -352,121 +234,93 @@ class FlashinferCUDAAttentionWrapper(BaseAttentionWrapper):
         self.contains_prefill = False
         self.contains_decode = False
 
+        self.is_profiling_iteration = any(
+            seq_metadata.block_table is None
+            for seq_metadata in seq_metadata_list
+        )
+        if self.is_profiling_iteration:
+            return
+
+        num_prefill_tokens = 0
+        num_decode_tokens = 0
+        batch_size = len(seq_metadata_list)
+
+        # Handle the prompt logic
         for seq_metadata in seq_metadata_list:
             if not seq_metadata.is_prompt:
                 continue
-
-            # ONLY used for profiling
-            if seq_metadata.block_table is None:
-                self.is_profiling_iteration = True
-                # During memory profiling, the block tables are not initialized yet.
-                #  We will just skip the attention computation for now.
-                return
-
-            self.contains_prefill = True
-
             prompt_chunk_len = seq_metadata.prompt_chunk_len
             processed_prompt_len = seq_metadata.seq.get_num_prompt_tokens_processed()
             current_total_len = processed_prompt_len + prompt_chunk_len
 
-            # indptr for the prompt tokens in q/o tensor
-            prefill_qo_indptr.append(prefill_qo_indptr[-1] + prompt_chunk_len)
             # Compute the kv page indices for the prompt tokens.
             num_blocks_in_use = (
                                     current_total_len + self.block_size - 1
                                 ) // self.block_size
-            prefill_kv_page_indices.extend(seq_metadata.block_table[:num_blocks_in_use])
-            prefill_kv_page_indptr.append(
-                prefill_kv_page_indptr[-1] + num_blocks_in_use
+            num_prefill_tokens += prompt_chunk_len
+
+            qo_indptr.append(qo_indptr[-1] + prompt_chunk_len)
+            kv_page_indices.extend(seq_metadata.block_table[:num_blocks_in_use])
+            kv_page_indptr.append(
+                kv_page_indptr[-1] + num_blocks_in_use
             )
-            prefill_kv_last_page_len.append(
+            kv_last_page_len.append(
                 current_total_len % self.block_size or self.block_size
             )
 
+            pass
+
+        # Handle the decoding logic
         for seq_metadata in seq_metadata_list:
             if seq_metadata.is_prompt:
                 continue
 
-            if seq_metadata.block_table is None:
-                self.is_profiling_iteration = True
-                return
-
-            self.contains_decode = True
-
             context_len = seq_metadata.seq.get_len()
-            # indptr for the prompt tokens in q/o tensor
-            decode_qo_indptr.append(decode_qo_indptr[-1] + 1)
-            # Compute the kv page indices for the prompt tokens.
+            qo_indptr.append(qo_indptr[-1] + 1)
             num_blocks_in_use = (context_len + self.block_size - 1) // self.block_size
-            decode_kv_page_indices.extend(seq_metadata.block_table[:num_blocks_in_use])
-            decode_kv_page_indptr.append(decode_kv_page_indptr[-1] + num_blocks_in_use)
-            decode_kv_last_page_len.append(
+            kv_page_indices.extend(seq_metadata.block_table[:num_blocks_in_use])
+            kv_page_indptr.append(kv_page_indptr[-1] + num_blocks_in_use)
+            kv_last_page_len.append(
                 context_len % self.block_size or self.block_size
             )
 
-        assert not self.is_profiling_iteration, f"prefill and decode wrapper is not set during profiling."
+            num_decode_tokens += 1
+            pass
 
-        self.num_prefill_tokens = prefill_qo_indptr[-1]
-        self.num_total_tokens = self.num_prefill_tokens + len(decode_qo_indptr) - 1
-        self.num_decode_tokens = self.num_total_tokens - self.num_prefill_tokens
+        assert not self.is_profiling_iteration, f"wrapper is not set during profiling."
 
-        self.prefill_wrapper = self._prefill_wrappers[self.num_prefill_tokens]
-        self.decode_wrapper = self._decode_wrappers[self.num_decode_tokens]
+        self.num_prefill_tokens = num_prefill_tokens
+        self.num_decode_tokens = num_decode_tokens
+        self.num_total_tokens = num_prefill_tokens + num_decode_tokens
 
-        if self.contains_prefill:
-            self.prefill_wrapper.begin_forward(
-                self.to_int_tensor(prefill_qo_indptr),
-                self.to_int_tensor(prefill_kv_page_indptr),
-                self.to_int_tensor(prefill_kv_page_indices),
-                self.to_int_tensor(prefill_kv_last_page_len),
+        wrapper = self._wrappers[batch_size]
+        self.wrapper = wrapper
+        if batch_size > 0:
+            wrapper.begin_forward(
+                self.to_int_tensor(qo_indptr),
+                self.to_int_tensor(kv_page_indptr),
+                self.to_int_tensor(kv_page_indices),
+                self.to_int_tensor(kv_last_page_len),
                 self.num_q_heads,
                 self.num_kv_heads,
                 self.head_dim,
                 self.block_size,
             )
 
-        if self.contains_decode:
-            self.decode_wrapper.begin_forward(
-                self.to_int_tensor(decode_qo_indptr),
-                self.to_int_tensor(decode_kv_page_indptr),
-                self.to_int_tensor(decode_kv_page_indices),
-                self.to_int_tensor(decode_kv_last_page_len),
-                self.num_q_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                self.block_size,
-            )
-
-        append_qo_indptr_tensor = prefill_qo_indptr[:-1] + [x + prefill_qo_indptr[-1] for x in decode_qo_indptr]
-        append_kv_page_indices_tensor = prefill_kv_page_indices + decode_kv_page_indices
-        append_kv_page_indptr_tensor = prefill_kv_page_indptr[:-1] + [x + prefill_kv_page_indptr[-1] for x in
-                                                                      decode_kv_page_indptr]
-        append_kv_last_page_len_tensor = prefill_kv_last_page_len + decode_kv_last_page_len
-
-        # Assign the value to captured tensor.
-        self.append_qo_indptr_tensor[:len(append_qo_indptr_tensor)] = self.to_int_tensor(
-            append_qo_indptr_tensor
-        )
-        self.append_kv_page_indices_tensor[:len(append_kv_page_indices_tensor)] = self.to_int_tensor(
-            append_kv_page_indices_tensor
-        )
-        self.append_kv_page_indptr_tensor[:len(append_kv_page_indptr_tensor)] = self.to_int_tensor(
-            append_kv_page_indptr_tensor
-        )
-        self.append_kv_last_page_len_tensor[:len(append_kv_last_page_len_tensor)] = self.to_int_tensor(
-            append_kv_last_page_len_tensor
-        )
+        self.append_qo_indptr_tensor[:len(qo_indptr)] = self.to_int_tensor(qo_indptr)
+        self.append_kv_page_indices_tensor[:len(kv_page_indices)] = self.to_int_tensor(kv_page_indices)
+        self.append_kv_page_indptr_tensor[:len(kv_page_indptr)] = self.to_int_tensor(kv_page_indptr)
+        self.append_kv_last_page_len_tensor[:len(kv_last_page_len)] = self.to_int_tensor(kv_last_page_len)
+        return
 
     def end_forward(self):
         self.is_metadata_initialized = False
         if self.is_profiling_iteration:
             return
 
-        if self.contains_prefill:
-            self.prefill_wrapper.end_forward()
-
-        if self.contains_decode:
-            self.decode_wrapper.end_forward()
+        if self.wrapper:
+            self.wrapper.end_forward()
+        return
 
     def forward(
         self,
@@ -503,23 +357,15 @@ class FlashinferCUDAAttentionWrapper(BaseAttentionWrapper):
             )
 
         with self.get_timer(OperationMetrics.ATTN_PREFILL, layer_id):
-            if self.contains_prefill:
-                output[: self.num_prefill_tokens] = self.prefill_wrapper.forward(
-                    query[: self.num_prefill_tokens],
+            num_tokens = self.num_prefill_tokens + self.num_decode_tokens
+            wrapper = self.wrapper
+
+            if num_tokens > 0:
+                output[: num_tokens] = wrapper.forward(
+                    query[: num_tokens],
                     kv_cache,
                     pos_encoding_mode="NONE",
                     sm_scale=softmax_scale,
-                )
-
-        with self.get_timer(OperationMetrics.ATTN_DECODE, layer_id):
-            if self.contains_decode:
-                output[self.num_prefill_tokens: self.num_total_tokens] = (
-                    self.decode_wrapper.forward(
-                        query[self.num_prefill_tokens: self.num_total_tokens],
-                        kv_cache,
-                        pos_encoding_mode="NONE",
-                        sm_scale=softmax_scale,
-                    )
                 )
 
         with self.get_timer(OperationMetrics.ATTN_OUTPUT_RESHAPE, layer_id):
