@@ -242,6 +242,7 @@ class ModelRunner:
         wrapper.begin_forward(seq_metadata_list)
 
         batch_size = len(seq_metadata_list)
+        chunk_size = len(input_tokens)
         with self._model_execution_e2e_timer:
             # Execute the model.
             try:
@@ -252,12 +253,16 @@ class ModelRunner:
                         input_positions=input_positions,
                     ))
 
+                    input_tokens_ = wrapper.buffer.input_tokens[:chunk_size]
+                    input_positions_ = wrapper.buffer.input_positions[:chunk_size]
+
                     cuda_graph = self.get_cuda_graph(
                         batch_size=batch_size
                     )
                     if cuda_graph is None:
                         cuda_graph, output = self.capture_cuda_graph(
-                            input_tokens, input_positions, gpu_cache,
+                            input_tokens_, input_positions_,
+                            gpu_cache,
                         )
                         self.cuda_graphs[batch_size] = cuda_graph
                         self.cuda_graphs_output[batch_size] = output

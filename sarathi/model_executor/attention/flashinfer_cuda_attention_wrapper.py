@@ -26,11 +26,11 @@ def copy_tensor_portion(dst, src):
 class SharedBuffer:
     # Prefill / Decode Batch Size
     prefill_batch_size: int
-    decode_batch_size: int
     device: torch.device = torch.device("cuda")
 
     # GPU cache
     total_page_count: int = 1024  # TODO: get this number after profiling...
+    max_chunk_size: int = 2048
     gpu_cache: List[torch.Tensor] = None
 
     # Prelude to `ModelRunner.run()`
@@ -58,40 +58,29 @@ class SharedBuffer:
 
     @property
     def batch_size(self):
-        return self.prefill_batch_size + self.decode_batch_size
+        return self.prefill_batch_size
 
     def __post_init__(self):
-        assert self.prefill_batch_size > 0 or self.decode_batch_size > 0
+        assert self.prefill_batch_size > 0
 
         device = self.device
-        prefill_batch_size = self.prefill_batch_size
-        decode_batch_size = self.decode_batch_size
         batch_size = self.batch_size
 
         alloc = lambda n: torch.empty(n, dtype=torch.int32, device=device)
 
         if self.input_tokens is None:
-            self.input_tokens = torch.empty(batch_size, dtype=torch.long, device=device)
+            self.input_tokens = torch.empty(self.max_chunk_size, dtype=torch.long, device=device)
         if self.input_positions is None:
-            self.input_positions = torch.empty(batch_size, dtype=torch.long, device=device)
+            self.input_positions = torch.empty(self.max_chunk_size, dtype=torch.long, device=device)
 
         if self.prefill_qo_indptr is None:
-            self.prefill_qo_indptr = alloc(prefill_batch_size + 1)
+            self.prefill_qo_indptr = alloc(batch_size + 1)
         if self.prefill_kv_page_indices is None:
             self.prefill_kv_page_indices = alloc(self.total_page_count)
         if self.prefill_kv_last_page_len is None:
-            self.prefill_kv_last_page_len = alloc(prefill_batch_size)
+            self.prefill_kv_last_page_len = alloc(batch_size)
         if self.prefill_kv_page_indptr is None:
-            self.prefill_kv_page_indptr = alloc(prefill_batch_size + 1)
-
-        if self.decode_qo_indptr is None:
-            self.decode_qo_indptr = alloc(decode_batch_size + 1)
-        if self.decode_kv_page_indices is None:
-            self.decode_kv_page_indices = alloc(self.total_page_count)
-        if self.decode_kv_last_page_len is None:
-            self.decode_kv_last_page_len = alloc(decode_batch_size)
-        if self.decode_kv_page_indptr is None:
-            self.decode_kv_page_indptr = alloc(decode_batch_size + 1)
+            self.prefill_kv_page_indptr = alloc(batch_size + 1)
 
         if self.append_qo_indptr_tensor is None:
             self.append_qo_indptr_tensor = alloc(batch_size + 1)
@@ -108,23 +97,19 @@ class SharedBuffer:
 
         return SharedBuffer(
             prefill_batch_size=prefill_batch_size,
-            decode_batch_size=decode_batch_size,
             device=self.device,
 
             total_page_count=self.total_page_count,
-            input_tokens=self.input_tokens[:batch_size],
-            input_positions=self.input_positions[:batch_size],
+            # TODO: The input_tokens and input_positions
+            #  should not be restricted by the batch size.
+            input_tokens=self.input_tokens,
+            input_positions=self.input_positions,
             gpu_cache=self.gpu_cache,
 
             prefill_qo_indptr=self.prefill_qo_indptr[:prefill_batch_size + 1],
             prefill_kv_page_indptr=self.prefill_kv_page_indptr[:prefill_batch_size + 1],
             prefill_kv_page_indices=self.prefill_kv_page_indices,
             prefill_kv_last_page_len=self.prefill_kv_last_page_len[:prefill_batch_size],
-
-            decode_qo_indptr=self.decode_qo_indptr[:decode_batch_size + 1],
-            decode_kv_page_indptr=self.decode_kv_page_indptr[:decode_batch_size + 1],
-            decode_kv_page_indices=self.decode_kv_page_indices,
-            decode_kv_last_page_len=self.decode_kv_last_page_len[:decode_batch_size],
 
             append_qo_indptr_tensor=self.append_qo_indptr_tensor[:batch_size + 1],
             append_kv_page_indices_tensor=self.append_kv_page_indices_tensor,
@@ -144,14 +129,6 @@ class SharedBuffer:
             paged_kv_indptr_buf=self.prefill_kv_page_indptr,
             paged_kv_indices_buf=self.prefill_kv_page_indices,
             paged_kv_last_page_len_buf=self.prefill_kv_last_page_len
-        )
-
-    def get_decode_buf(self):
-        return dict(
-            qo_indptr_buf=self.decode_qo_indptr,
-            paged_kv_indptr_buf=self.decode_kv_page_indptr,
-            paged_kv_indices_buf=self.decode_kv_page_indices,
-            paged_kv_last_page_len_buf=self.decode_kv_last_page_len
         )
 
 
@@ -184,7 +161,6 @@ class FlashinferCUDAAttentionWrapper(BaseAttentionWrapper):
 
         self.buffer = SharedBuffer(
             prefill_batch_size=1024,  # max prefill batch size
-            decode_batch_size=1024,  # max decode batch size
             device=device,
             total_page_count=65535  # max page count we can get. OK to set it bigger.
         )
