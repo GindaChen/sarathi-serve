@@ -200,7 +200,7 @@ class FlashinferCUDAAttentionWrapper(BaseAttentionWrapper):
         for batch_size in batch_size_to_sample:
             buffer = self.buffer.prepare_sliced_buffer(batch_size, 0)
             wrapper = BatchPrefillWithPagedKVCacheWrapper(
-                workspace_buffer, "NHD",
+                workspace_buffer, "NHD", use_cuda_graph=True,
                 **buffer.get_prefill_buf()
             )
             self._wrappers[batch_size] = wrapper
@@ -218,6 +218,10 @@ class FlashinferCUDAAttentionWrapper(BaseAttentionWrapper):
             self.head_dim,
             **kwargs,
         )
+
+    def set_wrapper(self, batch_size):
+        self.wrapper = self._wrappers[batch_size]
+        return self.wrapper
 
     def begin_forward(
         self,
@@ -293,8 +297,7 @@ class FlashinferCUDAAttentionWrapper(BaseAttentionWrapper):
         self.num_decode_tokens = num_decode_tokens
         self.num_total_tokens = num_prefill_tokens + num_decode_tokens
 
-        wrapper = self._wrappers[batch_size]
-        self.wrapper = wrapper
+        wrapper = self.set_wrapper(batch_size)
         if batch_size > 0:
             wrapper.begin_forward(
                 self.to_int_tensor(qo_indptr),
@@ -320,6 +323,7 @@ class FlashinferCUDAAttentionWrapper(BaseAttentionWrapper):
 
         if self.wrapper:
             self.wrapper.end_forward()
+        self.wrapper = None
         return
 
     def forward(

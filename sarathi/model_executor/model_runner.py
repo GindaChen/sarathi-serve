@@ -11,7 +11,7 @@ from sarathi.logger import init_logger
 from sarathi.metrics.constants import CpuOperationMetrics
 from sarathi.metrics.cpu_timer import CpuTimer
 from sarathi.model_executor import get_model, set_random_seed
-from sarathi.model_executor.attention import get_attention_wrapper
+from sarathi.model_executor.attention import get_attention_wrapper, is_cuda_wrapper
 from sarathi.model_executor.layers.sampler import Sampler
 from sarathi.model_executor.utils import pad_to_alignment
 from sarathi.utils import get_gpu_memory
@@ -40,8 +40,8 @@ class ModelRunner:
             config.cache_config.block_size,
             self.device,
         )
-        self.use_cuda_graph = wrapper.is_cuda_wrapper()
-        self.cuda_graphs: Dict[Tuple[int, int], 'torch.cuda.CUDAGraph'] = {}
+        self.use_cuda_graph = is_cuda_wrapper()
+        self.cuda_graphs: Dict[int, 'torch.cuda.CUDAGraph'] = {}
 
         self.sampler: Optional[Sampler] = None
         if self.model.lm_head:
@@ -223,57 +223,10 @@ class ModelRunner:
         self,
         gpu_cache: Optional[List[torch.Tensor]] = None,
     ):
-        # TODO: Change the batch sizes to appropriate values...
-        _BATCH_SIZE_ALIGNMENT = 8
-        _BATCH_SIZES_TO_CAPTURE = [1, 2, 4] + [
-            _BATCH_SIZE_ALIGNMENT * i for i in range(1, 33)
-        ]
+        pass
 
-        for prefill_batch_size in [8, 16, 32]:
-            for decode_batch_size in [8, 16, ]:
-                # TODO: Get the appropriate sequence metadata list...
-                #   Create sequence metadata list with the given batch sizes.
-                #   Prepare `prefill_batch_size` with 1 request with context len = `prefill_batch_size`
-                #   and `decode_batch_size` number of sequence where each sequence has context len = 1.
-
-                # Capture input_tokens and input_positions using what the buffer has prepared.
-                batch_size = prefill_batch_size + decode_batch_size
-                input_tokens = torch.tensor([i for i in range(batch_size)], dtype=torch.long, device=self.device)
-                input_positions = torch.tensor([i for i in range(batch_size)], dtype=torch.long, device=self.device)
-                buffer = get_attention_wrapper().buffer.prepare_sliced_buffer(prefill_batch_size, decode_batch_size)
-                buffer.prepare_buffer_bulk(dict(
-                    input_tokens=input_tokens,
-                    input_positions=input_positions,
-                ))
-
-                # Get the wrapper prepared
-                wrapper = get_attention_wrapper()
-                wrapper.begin_forward_for_capture(prefill_batch_size, decode_batch_size)
-
-                # Warm up...
-                _NUM_WARMUP_ITERS = 2
-                for _ in range(_NUM_WARMUP_ITERS):
-                    self.model(
-                        hidden_states=input_tokens,
-                        positions=input_positions,
-                        kv_caches=gpu_cache,
-                    )
-                torch.cuda.synchronize()
-
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    self.model(
-                        hidden_states=input_tokens,
-                        positions=input_positions,
-                        kv_caches=gpu_cache,
-                    )
-                    gc.collect()
-                torch.cuda.synchronize()
-
-                wrapper.end_forward()
-
-    def get_cuda_graph(self, num_prefill_tokens, num_decode_tokens):
-        return self.cuda_graphs[(num_prefill_tokens, num_decode_tokens)]
+    def get_cuda_graph(self, batch_size: int):
+        return self.cuda_graphs[batch_size]
 
     def run(
         self,
@@ -286,6 +239,7 @@ class ModelRunner:
 
         get_attention_wrapper().begin_forward(seq_metadata_list)
 
+        batch_size = len(seq_metadata_list)
         with self._model_execution_e2e_timer:
             # Execute the model.
             try:
@@ -295,9 +249,9 @@ class ModelRunner:
                         input_tokens=input_tokens,
                         input_positions=input_positions,
                     ))
+
                     cuda_graph = self.get_cuda_graph(
-                        wrapper.num_prefill_tokens,
-                        wrapper.num_decode_tokens
+                        batch_size=batch_size
                     )
                     cuda_graph.replay()
                     output = wrapper.get_output()

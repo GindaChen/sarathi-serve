@@ -157,11 +157,6 @@ class BaseWorker:
         self.seq_manager = WorkerSequenceManager(
             self.config,
         )
-
-        # If cuda graph is enabled,
-        # we also need to setup the CUDA graphs.
-        self.model_runner.capture_cuda_graphs(self.gpu_cache)
-
         self.execution_thread.start()
 
     def wait_till_ready(self) -> None:
