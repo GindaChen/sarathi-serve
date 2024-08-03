@@ -200,3 +200,6 @@ high_tail_latency_output
 profiling_outputs
 env_2
 embedding_output/
+
+scratch/
+
