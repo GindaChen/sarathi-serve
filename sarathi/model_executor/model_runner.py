@@ -312,6 +312,17 @@ class ModelRunner:
         """
 
         logger.debug(f"Capture CUDA graph for {len(input_tokens)=}...")
+
+        logger.debug(f"Warm up CUDA graph capture for {len(input_tokens)=}...")
+        for i in range(3):
+            logger.debug(f"Warm up {i + 1}th ...")
+            output = self.model(
+                hidden_states=input_tokens,
+                positions=input_positions,
+                kv_caches=gpu_cache,
+            )
+        logger.debug(f"Warm up CUDA graph capture finished.")
+
         with self._cuda_graph_capture_timer:
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):

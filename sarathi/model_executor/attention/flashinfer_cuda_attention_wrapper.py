@@ -8,6 +8,8 @@ from sarathi.config import ModelConfig, ParallelConfig
 from sarathi.core.datatypes.sequence import SequenceMetadata
 from sarathi.metrics.constants import OperationMetrics
 from sarathi.model_executor.attention.base_attention_wrapper import BaseAttentionWrapper
+from sarathi.logger import init_logger
+logger = init_logger(__name__)
 
 
 def copy_tensor_portion(dst, src):
@@ -203,6 +205,7 @@ class FlashinferCUDAAttentionWrapper(BaseAttentionWrapper):
         self,
         seq_metadata_list: List[SequenceMetadata],
     ) -> None:
+        logger.debug(f"begin_forward()...")
         qo_indptr: List[int] = [0]
         kv_page_indices: List[int] = []
         kv_last_page_len: List[int] = []
@@ -219,6 +222,7 @@ class FlashinferCUDAAttentionWrapper(BaseAttentionWrapper):
             for seq_metadata in seq_metadata_list
         )
         if self.is_profiling_iteration:
+            logger.debug(f"Profiling iteration detected. Returning...")
             return
 
         num_prefill_tokens = 0
@@ -247,7 +251,6 @@ class FlashinferCUDAAttentionWrapper(BaseAttentionWrapper):
             kv_last_page_len.append(
                 current_total_len % self.block_size or self.block_size
             )
-
             pass
 
         # Handle the decoding logic
@@ -274,7 +277,13 @@ class FlashinferCUDAAttentionWrapper(BaseAttentionWrapper):
         self.num_total_tokens = num_prefill_tokens + num_decode_tokens
 
         wrapper = self.set_wrapper(batch_size)
+        # logger.debug(f"Set wrapper: {wrapper}")
+
         if batch_size > 0:
+            wrapper.end_forward()
+            self.default_wrapper.end_forward()
+
+            logger.debug(f"Begin forward called with batch size: {batch_size}")
             wrapper.begin_forward(
                 self.to_int_tensor(qo_indptr),
                 self.to_int_tensor(kv_page_indptr),
@@ -285,11 +294,41 @@ class FlashinferCUDAAttentionWrapper(BaseAttentionWrapper):
                 self.head_dim,
                 self.block_size,
             )
+            logger.debug(f"Begin forward called also for default wrapper")
+            self.default_wrapper.begin_forward(
+                self.to_int_tensor(qo_indptr),
+                self.to_int_tensor(kv_page_indptr),
+                self.to_int_tensor(kv_page_indices),
+                self.to_int_tensor(kv_last_page_len),
+                self.num_q_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.block_size,
+            )
 
-        self.append_qo_indptr_tensor[:len(qo_indptr)] = self.to_int_tensor(qo_indptr)
-        self.append_kv_page_indices_tensor[:len(kv_page_indices)] = self.to_int_tensor(kv_page_indices)
-        self.append_kv_page_indptr_tensor[:len(kv_page_indptr)] = self.to_int_tensor(kv_page_indptr)
-        self.append_kv_last_page_len_tensor[:len(kv_last_page_len)] = self.to_int_tensor(kv_last_page_len)
+        self.buffer.prepare_buffer_bulk(
+            dict(
+                append_qo_indptr_tensor=self.to_int_tensor(qo_indptr),
+                append_kv_page_indices_tensor=self.to_int_tensor(kv_page_indices),
+                append_kv_page_indptr_tensor=self.to_int_tensor(kv_page_indptr),
+                append_kv_last_page_len_tensor=self.to_int_tensor(kv_last_page_len),
+            )
+        )
+
+        self.append_qo_indptr_tensor = self.buffer.append_qo_indptr_tensor[:len(qo_indptr)]
+        # logger.debug(f"{self.append_qo_indptr_tensor.shape = }")
+        # assert self.append_qo_indptr_tensor.shape == (batch_size + 1, )
+
+        # self.append_kv_page_indices_tensor = self.buffer.append_kv_page_indices_tensor[:len(kv_page_indices)]
+        self.append_kv_page_indices_tensor = self.buffer.append_kv_page_indices_tensor
+        # logger.debug(f"{self.append_kv_page_indices_tensor.shape = }")
+        # assert self.append_kv_page_indices_tensor.shape == (len(kv_page_indices), )
+
+        self.append_kv_page_indptr_tensor = self.buffer.append_kv_page_indptr_tensor[: batch_size + 1]
+        # logger.debug(f"{self.append_kv_page_indptr_tensor.shape = }")
+
+        self.append_kv_last_page_len_tensor = self.buffer.append_kv_last_page_len_tensor[:len(kv_last_page_len)]
+        # logger.debug(f"{self.append_kv_last_page_len_tensor.shape = }")
         return
 
     def end_forward(self):
@@ -312,6 +351,7 @@ class FlashinferCUDAAttentionWrapper(BaseAttentionWrapper):
         layer_id: Optional[int] = None,
     ) -> torch.Tensor:
         assert self.is_metadata_initialized, "Metadata is not initialized."
+        assert self.wrapper is not None
 
         if self.is_profiling_iteration:
             # there is no need to call attention in profiling mode
@@ -321,8 +361,6 @@ class FlashinferCUDAAttentionWrapper(BaseAttentionWrapper):
             query = query.contiguous().reshape(-1, self.num_q_heads, self.head_dim)
             key = key.contiguous().reshape(-1, self.num_kv_heads, self.head_dim)
             value = value.contiguous().reshape(-1, self.num_kv_heads, self.head_dim)
-
-        output = torch.empty_like(query)
 
         with self.get_timer(OperationMetrics.ATTN_KV_CACHE_SAVE, layer_id):
             append_paged_kv_cache(
@@ -336,13 +374,15 @@ class FlashinferCUDAAttentionWrapper(BaseAttentionWrapper):
                 kv_layout="NHD",
             )
 
+        output = torch.empty_like(query, device=query.device)
         with self.get_timer(OperationMetrics.ATTN_PREFILL, layer_id):
             num_tokens = self.num_prefill_tokens + self.num_decode_tokens
             wrapper = self.wrapper
 
             if num_tokens > 0:
-                output[: num_tokens] = wrapper.forward(
-                    query[: num_tokens],
+                # TODO: Shall we preallocate the output tensor?
+                output[:] = wrapper.forward(
+                    query,
                     kv_cache,
                     pos_encoding_mode="NONE",
                     sm_scale=softmax_scale,
