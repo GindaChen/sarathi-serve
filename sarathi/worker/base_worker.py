@@ -157,7 +157,6 @@ class BaseWorker:
         self.seq_manager = WorkerSequenceManager(
             self.config,
         )
-
         self.execution_thread.start()
 
     def wait_till_ready(self) -> None:

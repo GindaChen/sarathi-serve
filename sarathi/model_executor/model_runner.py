@@ -1,4 +1,5 @@
-from typing import List, Optional, Tuple
+import gc
+from typing import List, Optional, Tuple, Dict
 
 import torch
 import torch.distributed
@@ -10,7 +11,7 @@ from sarathi.logger import init_logger
 from sarathi.metrics.constants import CpuOperationMetrics
 from sarathi.metrics.cpu_timer import CpuTimer
 from sarathi.model_executor import get_model, set_random_seed
-from sarathi.model_executor.attention import get_attention_wrapper
+from sarathi.model_executor.attention import get_attention_wrapper, is_cuda_wrapper
 from sarathi.model_executor.layers.sampler import Sampler
 from sarathi.model_executor.utils import pad_to_alignment
 from sarathi.utils import get_gpu_memory
@@ -32,12 +33,16 @@ class ModelRunner:
         self.rank = rank
 
         self.model = get_model(self.config.model_config)
-        get_attention_wrapper().init(
+        wrapper = get_attention_wrapper()
+        wrapper.init(
             config.model_config,
             config.parallel_config,
             config.cache_config.block_size,
             self.device,
         )
+        self.use_cuda_graph = is_cuda_wrapper()
+        self.cuda_graphs: Dict[int, 'torch.cuda.CUDAGraph'] = {}
+        self.cuda_graphs_output: Dict[int, 'torch.Tensor'] = {}
 
         self.sampler: Optional[Sampler] = None
         if self.model.lm_head:
@@ -53,6 +58,9 @@ class ModelRunner:
         )
         self._model_execution_e2e_timer = CpuTimer(
             CpuOperationMetrics.MODEL_EXECUTION_E2E, rank=self.rank
+        )
+        self._cuda_graph_capture_timer = CpuTimer(
+            CpuOperationMetrics.CUDA_GRAPH_CAPTURE, rank=self.rank
         )
 
     def _prepare_inputs(
@@ -215,6 +223,9 @@ class ModelRunner:
         set_random_seed(self.config.model_config.seed)
         return num_gpu_blocks
 
+    def get_cuda_graph(self, batch_size: int):
+        return self.cuda_graphs.get(batch_size, None)
+
     def run(
         self,
         seq_metadata_list: List[SequenceMetadata],
@@ -224,16 +235,53 @@ class ModelRunner:
         with self._prepare_inputs_e2e_timer:
             input_tokens, input_positions = self._prepare_inputs(seq_metadata_list)
 
-        get_attention_wrapper().begin_forward(seq_metadata_list)
+        wrapper = get_attention_wrapper()
+        wrapper.begin_forward(seq_metadata_list)
 
+        batch_size = len(seq_metadata_list)
+        chunk_size = len(input_tokens)
         with self._model_execution_e2e_timer:
             # Execute the model.
             try:
-                output = self.model(
-                    hidden_states=input_tokens,
-                    positions=input_positions,
-                    kv_caches=gpu_cache,
-                )
+                if self.use_cuda_graph:
+                    # Prepare the CUDA graph captured buffer
+                    wrapper.buffer.prepare_buffer_bulk(dict(
+                        input_tokens=input_tokens,
+                        input_positions=input_positions,
+                    ))
+
+                    input_tokens_ = wrapper.buffer.input_tokens[:chunk_size]
+                    input_positions_ = wrapper.buffer.input_positions[:chunk_size]
+
+                    logger.debug(f"Use CUDA Graph for {chunk_size = }")
+
+                    cuda_graph = self.get_cuda_graph(
+                        batch_size=batch_size
+                    )
+                    if cuda_graph is None:
+                        logger.debug(f"CUDA Graph for {chunk_size = } not found. Capture now...")
+                        cuda_graph, output = self.capture_cuda_graph(
+                            input_tokens_, input_positions_,
+                            gpu_cache,
+                        )
+                        logger.debug(f"CUDA Graph capture seems to be successful.")
+                        self.cuda_graphs[batch_size] = cuda_graph
+                        self.cuda_graphs_output[batch_size] = output
+                        pass
+
+                    logger.debug(f"CUDA Graph replay for {chunk_size = }.")
+                    cuda_graph.replay()
+                    logger.debug(f"CUDA Graph replay finished.")
+                    output = self.cuda_graphs_output[batch_size]
+                    logger.debug(f"Use captured output.")
+                else:
+                    logger.debug(f"Not using CUDA graph for {chunk_size = }")
+                    output = self.model(
+                        hidden_states=input_tokens,
+                        positions=input_positions,
+                        kv_caches=gpu_cache,
+                    )
+
             except RuntimeError as e:
                 logger.error(
                     f"RuntimeError: {e} for seq_metadata_list: {seq_metadata_list}"
@@ -247,3 +295,42 @@ class ModelRunner:
         get_attention_wrapper().end_forward()
 
         return output
+
+    def capture_cuda_graph(
+        self, input_tokens, input_positions, gpu_cache
+    ) -> Tuple['torch.cuda.CUDAGraph', 'torch.Tensor']:
+        """
+        Capture the CUDA graph for the model execution.
+
+        Args:
+            input_tokens: The input tokens tensor.
+            input_positions: The input positions tensor.
+            gpu_cache: The GPU cache tensor.
+
+        Returns:
+            The captured CUDA graph and the model output.
+        """
+
+        logger.debug(f"Capture CUDA graph for {len(input_tokens)=}...")
+
+        logger.debug(f"Warm up CUDA graph capture for {len(input_tokens)=}...")
+        for i in range(3):
+            logger.debug(f"Warm up {i + 1}th ...")
+            output = self.model(
+                hidden_states=input_tokens,
+                positions=input_positions,
+                kv_caches=gpu_cache,
+            )
+        logger.debug(f"Warm up CUDA graph capture finished.")
+
+        with self._cuda_graph_capture_timer:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = self.model(
+                    hidden_states=input_tokens,
+                    positions=input_positions,
+                    kv_caches=gpu_cache,
+                )
+                pass
+        logger.debug(f"Capture CUDA graph finished.")
+        return graph, output
