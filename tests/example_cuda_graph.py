@@ -110,16 +110,18 @@ def test_generate(prompts):
         print(f"Prompt: {prompt!r}")
         print(f"Generated text: {generated_text!r}")
         print("===========================================================")
-    print("Test success")
+
 
 
 llm_engine = LLMEngine.from_system_config(system_config)
 print(system_config)
 
+for seq_len in [8, 42, 128,]:
+    for batch_size in [1, 2, 3, 4, 6, 8]:
+        print(f"Testing seq_len={seq_len}, batch_size={batch_size}")
+        prompts = [" a" * seq_len] * batch_size
+        test_generate(prompts)
+        print(f"Test success: seq_len={seq_len}, batch_size={batch_size}")
 
-
-# # prompts = ["The future of AI is here"]
-test_generate(["The "])  # batch_size = 1, prompt_len = [1]
-
-# llm_engine.pull_worker_metrics()
+    # llm_engine.pull_worker_metrics()
 # llm_engine.plot_metrics()
