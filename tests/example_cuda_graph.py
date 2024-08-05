@@ -1,6 +1,7 @@
 import datetime
 from sarathi.config.config import WorkerConfig
 from tqdm import tqdm
+from typing import List
 
 from sarathi.config import ModelConfig, ParallelConfig, SarathiSchedulerConfig, MetricsConfig, SystemConfig, \
     ReplicaConfig
