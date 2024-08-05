@@ -220,12 +220,6 @@ class ModelRunner:
         set_random_seed(self.config.model_config.seed)
         return num_gpu_blocks
 
-    def capture_cuda_graphs(
-        self,
-        gpu_cache: Optional[List[torch.Tensor]] = None,
-    ):
-        pass
-
     def get_cuda_graph(self, batch_size: int):
         return self.cuda_graphs.get(batch_size, None)
 
