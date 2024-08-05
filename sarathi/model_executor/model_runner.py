@@ -253,21 +253,29 @@ class ModelRunner:
                     input_tokens_ = wrapper.buffer.input_tokens[:chunk_size]
                     input_positions_ = wrapper.buffer.input_positions[:chunk_size]
 
+                    logger.debug(f"Use CUDA Graph for {chunk_size = }")
+
                     cuda_graph = self.get_cuda_graph(
                         batch_size=batch_size
                     )
                     if cuda_graph is None:
+                        logger.debug(f"CUDA Graph for {chunk_size = } not found. Capture now...")
                         cuda_graph, output = self.capture_cuda_graph(
                             input_tokens_, input_positions_,
                             gpu_cache,
                         )
+                        logger.debug(f"CUDA Graph capture seems to be successful.")
                         self.cuda_graphs[batch_size] = cuda_graph
                         self.cuda_graphs_output[batch_size] = output
                         pass
 
+                    logger.debug(f"CUDA Graph replay for {chunk_size = }.")
                     cuda_graph.replay()
+                    logger.debug(f"CUDA Graph replay finished.")
                     output = self.cuda_graphs_output[batch_size]
+                    logger.debug(f"Use captured output.")
                 else:
+                    logger.debug(f"Not using CUDA graph for {chunk_size = }")
                     output = self.model(
                         hidden_states=input_tokens,
                         positions=input_positions,
