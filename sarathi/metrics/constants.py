@@ -40,6 +40,7 @@ class CpuOperationMetrics(enum.Enum):
     PREPARE_INPUTS_E2E = "prepare_inputs_e2e"
     MODEL_EXECUTION_E2E = "model_execution_e2e"
     PROCESS_MODEL_OUTPUTS = "process_model_outputs"
+    CUDA_GRAPH_CAPTURE = "cuda_graph_capture"
 
 
 class SequenceMetricsTimeDistributions(enum.Enum):

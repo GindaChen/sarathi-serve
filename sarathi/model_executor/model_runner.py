@@ -59,6 +59,9 @@ class ModelRunner:
         self._model_execution_e2e_timer = CpuTimer(
             CpuOperationMetrics.MODEL_EXECUTION_E2E, rank=self.rank
         )
+        self._cuda_graph_capture_timer = CpuTimer(
+            CpuOperationMetrics.CUDA_GRAPH_CAPTURE, rank=self.rank
+        )
 
     def _prepare_inputs(
         self,
@@ -299,12 +302,16 @@ class ModelRunner:
         Returns:
             The captured CUDA graph and the model output.
         """
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            output = self.model(
-                hidden_states=input_tokens,
-                positions=input_positions,
-                kv_caches=gpu_cache,
-            )
-            pass
+
+        logger.debug(f"Capture CUDA graph for {len(input_tokens)=}...")
+        with self._cuda_graph_capture_timer:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = self.model(
+                    hidden_states=input_tokens,
+                    positions=input_positions,
+                    kv_caches=gpu_cache,
+                )
+                pass
+        logger.debug(f"Capture CUDA graph finished.")
         return graph, output
